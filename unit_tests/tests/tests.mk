@@ -216,7 +216,7 @@ TESTS_SRC_CPP = \
 	tests/controllers/can/test_obd2.cpp \
 	tests/controllers/test_long_term_fuel_trim.cpp \
 	tests/ignition_injection/test_ignition_state.cpp \
-	tests/core/test_main_loop.cpp \
+	tests/core/test_error_cookie.cpp \n	tests/core/test_main_loop.cpp \
 	tests/test_trip_odometer.cpp \
 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
 	tests/util/test_utils.cpp \

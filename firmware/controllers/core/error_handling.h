@@ -150,6 +150,11 @@ const char *errorCookieToName(ErrorCookie cookie);
 // evidence (write-once until the next boot clears it). See #9931.
 void errorHandlerRecordResetReason(ErrorCookie reason);
 
+// True for every cookie value a reset path deliberately writes; false for
+// None and for random first-power-on garbage. Boot-time sanitizing uses this
+// instead of a hand-maintained whitelist. See #9931.
+bool isKnownErrorCookie(ErrorCookie cookie);
+
 // Error handling/recovery/reporting information
 
 #define ERROR_STACK_DEPTH   96
