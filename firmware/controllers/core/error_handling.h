@@ -136,9 +136,19 @@ enum class ErrorCookie : uint32_t {
     FirmwareError = 0xcafebabe,
     HardFault = 0xdeadbeef,
     ChibiOsPanic = 0xdeadfa11,
+    // deliberate/exceptional reset paths below leave evidence too, so that a
+    // cookie of None after a soft reset unambiguously means wild jump or
+    // memory corruption, see #9931
+    NmiReset = 0x4e4d4921,     // spurious NMI ('NMI!')
+    SoftReset = 0xb007c0de,    // commanded reboot (TS/console/DFU-entry)
+    OpenBltJump = 0x0b17b007,  // commanded jump to OpenBLT
 };
 
 const char *errorCookieToName(ErrorCookie cookie);
+
+// Record why we are about to reset, without overwriting earlier crash
+// evidence (write-once until the next boot clears it). See #9931.
+void errorHandlerRecordResetReason(ErrorCookie reason);
 
 // Error handling/recovery/reporting information
 
