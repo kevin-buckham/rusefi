@@ -125,11 +125,6 @@ extern "C"
 {
 #endif /* __cplusplus */
 
-#if EFI_PROD_CODE
-
-// for port_extctx
-#include "ch.h"
-
 // These use very specific values to avoid interpreting random garbage memory as a real value
 enum class ErrorCookie : uint32_t {
     None = 0,
@@ -143,12 +138,6 @@ enum class ErrorCookie : uint32_t {
     SoftReset = 0xb007c0de,    // commanded reboot (TS/console/DFU-entry)
     OpenBltJump = 0x0b17b007,  // commanded jump to OpenBLT
 };
-
-const char *errorCookieToName(ErrorCookie cookie);
-
-// Record why we are about to reset, without overwriting earlier crash
-// evidence (write-once until the next boot clears it). See #9931.
-void errorHandlerRecordResetReason(ErrorCookie reason);
 
 // True for every cookie value a reset path deliberately writes; false for None
 // and for random first-power-on garbage. Boot-time sanitizing uses this instead
@@ -171,6 +160,28 @@ constexpr bool isKnownErrorCookie(ErrorCookie cookie) {
 	// not a member of the enum at all: random first-power-on garbage
 	return false;
 }
+
+// Compile-time proof (every build) that written cookies survive the boot-time
+// sanitize and garbage does not — the #9931 regression class.
+static_assert(isKnownErrorCookie(ErrorCookie::FirmwareError));
+static_assert(isKnownErrorCookie(ErrorCookie::HardFault));
+static_assert(isKnownErrorCookie(ErrorCookie::ChibiOsPanic));
+static_assert(isKnownErrorCookie(ErrorCookie::NmiReset));
+static_assert(isKnownErrorCookie(ErrorCookie::SoftReset));
+static_assert(isKnownErrorCookie(ErrorCookie::OpenBltJump));
+static_assert(!isKnownErrorCookie(ErrorCookie::None));
+static_assert(!isKnownErrorCookie((ErrorCookie)0x12345678));
+
+#if EFI_PROD_CODE
+
+// for port_extctx
+#include "ch.h"
+
+const char *errorCookieToName(ErrorCookie cookie);
+
+// Record why we are about to reset, without overwriting earlier crash
+// evidence (write-once until the next boot clears it). See #9931.
+void errorHandlerRecordResetReason(ErrorCookie reason);
 
 // Error handling/recovery/reporting information
 
