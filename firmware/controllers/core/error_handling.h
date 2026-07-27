@@ -150,10 +150,27 @@ const char *errorCookieToName(ErrorCookie cookie);
 // evidence (write-once until the next boot clears it). See #9931.
 void errorHandlerRecordResetReason(ErrorCookie reason);
 
-// True for every cookie value a reset path deliberately writes; false for
-// None and for random first-power-on garbage. Boot-time sanitizing uses this
-// instead of a hand-maintained whitelist. See #9931.
-bool isKnownErrorCookie(ErrorCookie cookie);
+// True for every cookie value a reset path deliberately writes; false for None
+// and for random first-power-on garbage. Boot-time sanitizing uses this instead
+// of a hand-maintained whitelist (the old three-value list silently erased any
+// newer cookie at boot, see #9931). constexpr in the header so it exists in
+// every build (error_handling.cpp is mostly EFI_PROD_CODE-only); no default
+// case so -Wswitch keeps it in sync when a new ErrorCookie is added.
+constexpr bool isKnownErrorCookie(ErrorCookie cookie) {
+	switch (cookie) {
+	case ErrorCookie::None:
+		return false; // nothing to report
+	case ErrorCookie::FirmwareError:
+	case ErrorCookie::HardFault:
+	case ErrorCookie::ChibiOsPanic:
+	case ErrorCookie::NmiReset:
+	case ErrorCookie::SoftReset:
+	case ErrorCookie::OpenBltJump:
+		return true;
+	}
+	// not a member of the enum at all: random first-power-on garbage
+	return false;
+}
 
 // Error handling/recovery/reporting information
 
