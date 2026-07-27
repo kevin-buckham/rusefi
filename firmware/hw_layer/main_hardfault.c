@@ -18,7 +18,12 @@ extern void rebootNow(void);
  */
 #define bkpt() __asm volatile("BKPT #0\n")
 
+extern void errorHandlerRecordNmiReset(void);
+
 void NMI_Handler(void) {
+	// evidence first: a silent NMI->reset is indistinguishable from memory
+	// corruption without this cookie, see #9931
+	errorHandlerRecordNmiReset();
 	rebootNow();
 }
 
