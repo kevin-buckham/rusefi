@@ -9,6 +9,8 @@
 
 #include "pch.h"
 
+#include "error_handling.h"
+
 TEST(errorCookie, writtenCookiesSurviveBootSanitize) {
 	// crash paths
 	EXPECT_TRUE(isKnownErrorCookie(ErrorCookie::FirmwareError));
