@@ -87,9 +87,7 @@ void errorHandlerInit() {
 
 	// Cookie can be some random value at first power on
 	// reset to None to avoid generating 'Unknown' fail report
-	if ((lastBootError.Cookie != ErrorCookie::FirmwareError) &&
-		(lastBootError.Cookie != ErrorCookie::HardFault) &&
-		(lastBootError.Cookie != ErrorCookie::ChibiOsPanic)) {
+	if (!isKnownErrorCookie(lastBootError.Cookie)) {
 		lastBootError.Cookie = ErrorCookie::None;
 	}
 
@@ -130,6 +128,25 @@ bool errorHandlerIsStartFromError() {
 #else
 	return 0;
 #endif
+}
+
+// Written cookies that survive to next-boot reporting. No default case: -Wswitch
+// keeps this list in sync when a new ErrorCookie is added (see #9931 — the
+// original three-value whitelist silently erased any newer cookie at boot).
+bool isKnownErrorCookie(ErrorCookie cookie) {
+	switch (cookie) {
+	case ErrorCookie::None:
+		return false; // nothing to report
+	case ErrorCookie::FirmwareError:
+	case ErrorCookie::HardFault:
+	case ErrorCookie::ChibiOsPanic:
+	case ErrorCookie::NmiReset:
+	case ErrorCookie::SoftReset:
+	case ErrorCookie::OpenBltJump:
+		return true;
+	}
+	// not a member of the enum at all: random first-power-on garbage
+	return false;
 }
 
 const char *errorCookieToName(ErrorCookie cookie)
