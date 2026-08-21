@@ -149,20 +149,63 @@ extern "C"
 {
 #endif /* __cplusplus */
 
-#if EFI_PROD_CODE
-
-// for port_extctx
-#include "ch.h"
-
 // These use very specific values to avoid interpreting random garbage memory as a real value
 enum class ErrorCookie : uint32_t {
     None = 0,
     FirmwareError = 0xcafebabe,
     HardFault = 0xdeadbeef,
     ChibiOsPanic = 0xdeadfa11,
+    // deliberate/exceptional reset paths below leave evidence too, so that a
+    // cookie of None after a soft reset unambiguously means wild jump or
+    // memory corruption, see #9931
+    NmiReset = 0x4e4d4921,     // spurious NMI ('NMI!')
+    SoftReset = 0xb007c0de,    // commanded reboot (TS/console/DFU-entry)
+    OpenBltJump = 0x0b17b007,  // commanded jump to OpenBLT
 };
 
+// True for every cookie value a reset path deliberately writes; false for None
+// and for random first-power-on garbage. Boot-time sanitizing uses this instead
+// of a hand-maintained whitelist (the old three-value list silently erased any
+// newer cookie at boot, see #9931). constexpr in the header so it exists in
+// every build (error_handling.cpp is mostly EFI_PROD_CODE-only); no default
+// case so -Wswitch keeps it in sync when a new ErrorCookie is added.
+constexpr bool isKnownErrorCookie(ErrorCookie cookie) {
+	switch (cookie) {
+	case ErrorCookie::None:
+		return false; // nothing to report
+	case ErrorCookie::FirmwareError:
+	case ErrorCookie::HardFault:
+	case ErrorCookie::ChibiOsPanic:
+	case ErrorCookie::NmiReset:
+	case ErrorCookie::SoftReset:
+	case ErrorCookie::OpenBltJump:
+		return true;
+	}
+	// not a member of the enum at all: random first-power-on garbage
+	return false;
+}
+
+// Compile-time proof (every build) that written cookies survive the boot-time
+// sanitize and garbage does not — the #9931 regression class.
+static_assert(isKnownErrorCookie(ErrorCookie::FirmwareError));
+static_assert(isKnownErrorCookie(ErrorCookie::HardFault));
+static_assert(isKnownErrorCookie(ErrorCookie::ChibiOsPanic));
+static_assert(isKnownErrorCookie(ErrorCookie::NmiReset));
+static_assert(isKnownErrorCookie(ErrorCookie::SoftReset));
+static_assert(isKnownErrorCookie(ErrorCookie::OpenBltJump));
+static_assert(!isKnownErrorCookie(ErrorCookie::None));
+static_assert(!isKnownErrorCookie((ErrorCookie)0x12345678));
+
+#if EFI_PROD_CODE
+
+// for port_extctx
+#include "ch.h"
+
 const char *errorCookieToName(ErrorCookie cookie);
+
+// Record why we are about to reset, without overwriting earlier crash
+// evidence (write-once until the next boot clears it). See #9931.
+void errorHandlerRecordResetReason(ErrorCookie reason);
 
 // Error handling/recovery/reporting information
 

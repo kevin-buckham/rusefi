@@ -104,9 +104,7 @@ void errorHandlerInit() {
 
 	// Cookie can be some random value at first power on
 	// reset to None to avoid generating 'Unknown' fail report
-	if ((lastBootError.Cookie != ErrorCookie::FirmwareError) &&
-		(lastBootError.Cookie != ErrorCookie::HardFault) &&
-		(lastBootError.Cookie != ErrorCookie::ChibiOsPanic)) {
+	if (!isKnownErrorCookie(lastBootError.Cookie)) {
 		lastBootError.Cookie = ErrorCookie::None;
 	}
 
@@ -163,6 +161,12 @@ const char *errorCookieToName(ErrorCookie cookie)
 		return "HardFault";
 	case ErrorCookie::ChibiOsPanic:
 		return "ChibiOS panic";
+	case ErrorCookie::NmiReset:
+		return "NMI";
+	case ErrorCookie::SoftReset:
+		return "commanded reboot";
+	case ErrorCookie::OpenBltJump:
+		return "OpenBLT jump";
 	}
 
 	return "Unknown";
@@ -294,6 +298,12 @@ static const char *errorHandlerGetErrorName(ErrorCookie cookie)
 		return "HardFault";
 	case ErrorCookie::ChibiOsPanic:
 		return "OSpanic";
+	case ErrorCookie::NmiReset:
+		return "NMI";
+	case ErrorCookie::SoftReset:
+		return "SoftReset";
+	case ErrorCookie::OpenBltJump:
+		return "OpenBLT";
 	}
 
 	return "unknown";
@@ -436,6 +446,21 @@ static void errorHandlerSaveStack(backupErrorState *err, uint32_t *sp)
 	}
 }
 #endif // EFI_BACKUP_SRAM
+
+void errorHandlerRecordResetReason(ErrorCookie reason) {
+#if EFI_BACKUP_SRAM
+	auto err = &getBackupSram()->err;
+	// write-once: never overwrite real crash evidence (HardFault/panic wrote first)
+	if (err->Cookie == ErrorCookie::None) {
+		err->Cookie = reason;
+	}
+#endif // EFI_BACKUP_SRAM
+}
+
+// C-callable wrapper for the NMI handler in main_hardfault.c
+extern "C" void errorHandlerRecordNmiReset(void) {
+	errorHandlerRecordResetReason(ErrorCookie::NmiReset);
+}
 
 void logHardFault(uint32_t type, uintptr_t faultAddress, void* sp, port_extctx* ctx, uint32_t csfr) {
     // todo: reuse hasCriticalFirmwareErrorFlag? something?

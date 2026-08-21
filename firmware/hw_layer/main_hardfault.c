@@ -18,7 +18,17 @@ extern void rebootNow(void);
  */
 #define bkpt() __asm volatile("BKPT #0\n")
 
+#ifndef EFI_BOOTLOADER
+extern void errorHandlerRecordNmiReset(void);
+#endif
+
 void NMI_Handler(void) {
+#ifndef EFI_BOOTLOADER
+	// evidence first: a silent NMI->reset is indistinguishable from memory
+	// corruption without this cookie, see #9931
+	// (bootloader links this file without error_handling.cpp, hence the guard)
+	errorHandlerRecordNmiReset();
+#endif
 	rebootNow();
 }
 

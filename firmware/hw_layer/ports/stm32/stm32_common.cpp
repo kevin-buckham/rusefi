@@ -43,6 +43,13 @@ extern "C" {
 #endif
 
 void rebootNow() {
+#ifndef EFI_BOOTLOADER
+	// deliberate reset: leave evidence (write-once; a crash path that called
+	// us after writing its own cookie is preserved), see #9931
+	// (bootloader links this file without error_handling.cpp, hence the guard)
+	errorHandlerRecordResetReason(ErrorCookie::SoftReset);
+#endif
+
 	#ifdef STM32H7XX
 		// H7 needs a forcible reset of the USB peripheral(s) in order for the bootloader to work properly.
 		// If you don't do this, the bootloader will execute, but USB doesn't work (nobody knows why)
@@ -103,6 +110,12 @@ void jump_to_bootloader() {
 
 void jump_to_openblt() {
 #if EFI_USE_OPENBLT
+#ifndef EFI_BOOTLOADER
+	// deliberate jump: leave evidence (written before rebootNow so this more
+	// specific cookie wins the write-once), see #9931
+	errorHandlerRecordResetReason(ErrorCookie::OpenBltJump);
+#endif
+
 	/* safe to call on already inited shares area */
 	SharedParamsInit();
 	/* Store sing to stay in OpenBLT */
