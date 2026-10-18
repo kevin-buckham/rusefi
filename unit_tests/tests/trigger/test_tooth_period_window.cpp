@@ -173,6 +173,9 @@ struct InstabilityRun {
 	std::vector<int> latched;
 	uint32_t seed = 11;
 	void tooth(double rpm, double ripple = 0.3, double jitter = 0.03) {
+		if (!f.w.postStartActive(1e9f)) {
+			f.w.markPostStart(1e9f); // these tests exercise the detector itself: keep the post-start window open
+		}
 		f.tooth(usPerDegAt(rpm, f.k, ripple, jitter, seed));
 		f.w.evaluateInstability(180, kCycle, kRatio, kRpmLimit);
 		latched.push_back(f.w.instabilityLatched(kCycle));
@@ -301,4 +304,37 @@ TEST(toothPeriodWindow, resetClosesThePostStartWindow) {
 	EXPECT_TRUE(f.w.postStartActive(1440));
 	f.w.reset();
 	EXPECT_FALSE(f.w.postStartActive(1440));
+}
+
+TEST(toothPeriodWindow, latchCannotOutliveThePostStartWindow) {
+	InstabilityRun r;
+	r.f.w.reset();
+	for (int i = 0; i < 40; i++) {
+		r.tooth(1000);
+	}
+	r.f.w.markPostStart(1440);
+	// like the firmware wiring: evaluate only while the window is open
+	auto step = [&](double rpm) {
+		r.f.tooth(usPerDegAt(rpm, r.f.k, 0.3, 0.03, r.seed));
+		if (r.f.w.postStartActive(1440)) {
+			r.f.w.evaluateInstability(180, kCycle, kRatio, kRpmLimit);
+		}
+	};
+	for (int i = 0; i < 36; i++) {
+		step(1000);
+	}
+	for (int i = 0; i < 6; i++) {
+		step(500); // trips in the last cycle of the window (teeth 36..42 of 48)
+	}
+	ASSERT_TRUE(r.f.w.postStartActive(1440));
+	ASSERT_TRUE(r.f.w.instabilityLatched(kCycle));
+	for (int i = 0; i < 6; i++) {
+		step(500);
+	}
+	EXPECT_FALSE(r.f.w.postStartActive(1440));
+	EXPECT_FALSE(r.f.w.instabilityLatched(kCycle)); // would stay true until the next reset without the window gate
+	for (int i = 0; i < 60; i++) {
+		step(500);
+		EXPECT_FALSE(r.f.w.instabilityLatched(kCycle));
+	}
 }

@@ -16,6 +16,10 @@
 
 #include <stddef.h>
 #include <math.h>
+#include <cmath>
+
+#include "rusefi/rusefi_time_math.h"  // NT2USF
+#include "efitime.h"                    // efitick_t
 
 class ToothPeriodWindow {
 public:
@@ -38,7 +42,8 @@ public:
 	 * Arm the post-start window (called on the switch to RUNNING, only when edgeDwellPostStartLatch is set): the
 	 * instability detector acts only until postStartWindowDeg of rotation have passed since this call.
 	 */
-	void markPostStart() {
+	void markPostStart(float windowDeg = 1440.0f) {
+		m_windowDeg = windowDeg;
 		m_postStartArmed = true;
 		m_degSincePostStart = 0;
 		m_unstableSeen = false;
@@ -134,11 +139,21 @@ public:
 		float covered = 0;
 		float sumUs = 0;
 		float cursor = fromPhase;
-		int guard = 0;
-		while (covered < wanted - epsDeg && guard++ < (int)kCapacity) {
+		// ISR cost bound: only the newest entries that span one cycle (plus one) can hold a twin, so the outer loop runs at
+		// most 'scan' times and the inner scan visits at most 'scan' entries. Worst case scan * scan phaseNear calls:
+		// 25 * 25 = 625 on the 12 tooth crank (24 teeth per cycle), and never more than kCapacity^2 on any wheel.
+		size_t scan = 0;
+		for (float acc = 0; scan < m_count && acc < cycleDeg; scan++) {
+			acc += m_span[(m_head + kCapacity - 1 - scan) % kCapacity];
+		}
+		if (scan < m_count) {
+			scan++;
+		}
+		size_t guard = 0;
+		while (covered < wanted - epsDeg && guard++ < scan) {
 			float twinStart = cursor - strokeDeg;
 			size_t twin = kCapacity;
-			for (size_t i = 0; i < m_count; i++) { // newest first: the most recent time the crank was at that angle
+			for (size_t i = 0; i < scan; i++) { // newest first: the most recent time the crank was at that angle
 				size_t idx = (m_head + kCapacity - 1 - i) % kCapacity;
 				if (phaseNear(m_endPhase[idx] - m_span[idx], twinStart, cycleDeg, epsDeg)) {
 					twin = idx;
@@ -237,7 +252,9 @@ public:
 
 	/** true for cycleDeg of rotation after the last trip of evaluateInstability() */
 	bool instabilityLatched(float cycleDeg) const {
-		return m_unstableSeen && m_degSinceUnstable < cycleDeg;
+		// never true outside the post-start window: m_degSinceUnstable only advances while evaluateInstability() runs,
+		// which stops with the window (windowDeg given to markPostStart), so the window itself gates the latch
+		return m_unstableSeen && m_degSinceUnstable < cycleDeg && m_postStartArmed && m_degSincePostStart < m_windowDeg;
 	}
 
 	static bool phaseNear(float a, float b, float cycleDeg, float epsDeg) {
@@ -246,12 +263,15 @@ public:
 	}
 
 	static float forwardDistance(float from, float to, float cycleDeg) {
-		float d = to - from;
-		while (d < 0) {
+		if (!(cycleDeg > 0) || !std::isfinite(cycleDeg) || !std::isfinite(from) || !std::isfinite(to)) {
+			return 0;
+		}
+		float d = fmodf(to - from, cycleDeg);
+		if (d < 0) {
 			d += cycleDeg;
 		}
-		while (d >= cycleDeg) {
-			d -= cycleDeg;
+		if (d >= cycleDeg) { // float rounding of d + cycleDeg
+			d = 0;
 		}
 		return d;
 	}
@@ -271,4 +291,5 @@ private:
 	float m_degSinceUnstable = 0;
 	bool m_postStartArmed = false;
 	float m_degSincePostStart = 0;
+	float m_windowDeg = 0;
 };
