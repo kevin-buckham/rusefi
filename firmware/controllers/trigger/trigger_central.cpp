@@ -9,6 +9,7 @@
 #include "pch.h"
 
 #include "trigger_central.h"
+#include "edge_dwell.h"
 #include "trigger_decoder.h"
 #include "main_trigger_callback.h"
 #include "listener_array.h"
@@ -146,6 +147,8 @@ angle_t TriggerCentral::syncEnginePhaseAndReport(int divider, int remainder) {
 		int indexOffset = (newSyncCounter - oldSyncCounter) * triggerShape.getSize();
 
 		instantRpm.offsetIndices(indexOffset);
+		// tooth phases just jumped by totalShift: intervals recorded before the jump are mislabelled
+		toothWindow.reset();
 
 		// Adjust phase-dependent variables
 		if (expectedNextPhase) {
@@ -847,6 +850,11 @@ bool boardAllowTriggerActions() {
 	return get_board_override_result(custom_board_boardAllowTriggerActions, true);
 }
 
+angle_t TriggerCentral::getToothEnginePhase(uint32_t eventIndex) const {
+	// same expression as currentEngineDecodedPhase in handleShaftSignal()
+	return wrapAngleMethod(triggerFormDetails.eventAngles[eventIndex] - tdcPosition(), "toothEnginePhase", ObdCode::CUSTOM_ERR_6555);
+}
+
 angle_t TriggerCentral::findNextTriggerToothAngle(int p_currentToothIndex) {
   int currentToothIndex = p_currentToothIndex;
 		// TODO: is this logic to compute next trigger tooth angle correct?
@@ -954,6 +962,19 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 	efiPrintf("trigger %d %d %d", triggerIndexForListeners, getRevolutionCounter(), time2print(getTimeNowUs()));
 #endif /* TRIGGER_EXTREME_LOGGING */
 
+		// Cranking edge-dwell: record this tooth's interval (both bits off = no work, no state)
+		if (engineConfiguration->crankingEdgeDwell || engineConfiguration->edgeDwellPostStartLatch) {
+			const float cycleDeg = getEngineState()->engineCycle;
+			toothWindow.onTooth(timestamp, currentEngineDecodedPhase, cycleDeg);
+			// the instability detector runs only in the post-start window, and only with its own bit
+			if (engineConfiguration->edgeDwellPostStartLatch && engineConfiguration->cylindersCount > 0) {
+				const float strokeDeg = cycleDeg / engineConfiguration->cylindersCount;
+				if (toothWindow.postStartActive(edgedwell::kPostStartWindowEvents * strokeDeg)) {
+					toothWindow.evaluateInstability(strokeDeg, cycleDeg, edgedwell::kInstabilityRatio, edgedwell::kInstabilityRpm);
+				}
+			}
+		}
+
 		// Update engine RPM
 		rpmShaftPositionCallback(signal, triggerIndexForListeners, timestamp);
 
@@ -993,6 +1014,9 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 
 		boardTriggerCallback(timestamp, currentEngineDecodedPhase);
 	} else {
+		// without sync tooth phases mean nothing: the speed window must start over
+		toothWindow.reset();
+
 		// We don't have sync, but report to the wave chart anyway as index 0.
 		reportEventToWaveChart(signal, 0, triggerShape.useOnlyRisingEdges);
 

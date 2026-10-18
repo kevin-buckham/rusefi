@@ -11,6 +11,7 @@
 #include "listener_array.h"
 #include "trigger_decoder.h"
 #include "instant_rpm_calculator.h"
+#include "tooth_period_window.h"
 #include "trigger_central_generated.h"
 #include <rusefi/timer.h>
 #include "pin_repository.h"
@@ -64,6 +65,19 @@ public:
   angle_t findNextTriggerToothAngle(int nextToothIndex);
 
 	InstantRpmCalculator instantRpm;
+
+	/**
+	 * Recent tooth intervals for the cranking edge-dwell scheduler only (crankingEdgeDwell).
+	 * Fed from handleShaftSignal() while that flag is set; never read by RPM, fuel or the state machine.
+	 */
+	ToothPeriodWindow toothWindow;
+
+	/**
+	 * Engine phase of trigger event 'eventIndex', computed with exactly the same arithmetic as
+	 * currentEngineDecodedPhase / findNextTriggerToothAngle so that the value is bit-identical to what
+	 * mainTriggerCallback receives for that tooth.
+	 */
+	angle_t getToothEnginePhase(uint32_t eventIndex) const;
 
 	void prepareTriggerShape() {
 #if EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT

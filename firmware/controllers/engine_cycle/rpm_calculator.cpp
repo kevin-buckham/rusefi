@@ -187,6 +187,10 @@ void RpmCalculator::setRpmValue(float value) {
 		if (state != RUNNING) {
 			// Store the time the engine started
 			engineStartTimer.reset();
+			// post-start instability window of the edge-dwell scheduler (own bit, default off)
+			if (engineConfiguration->edgeDwellPostStartLatch) {
+				engine->triggerCentral.toothWindow.markPostStart();
+			}
 		}
 
 		state = RUNNING;
@@ -274,6 +278,8 @@ void RpmCalculator::setStopSpinning() {
 		efiPrintf("engine stopped");
 	}
 	state = STOPPED;
+
+	engine->triggerCentral.toothWindow.reset();
 
 	// Broadcast "engine stopped" to all engine modules so they can reset their own state
 	// (trigger sync, instant RPM history, schedulers, etc.). See Engine::onEngineStopped.
