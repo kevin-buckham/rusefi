@@ -21,6 +21,10 @@ float dwellVoltageCorrection;Ign: Dwell voltage correction
     float luaTimingAdd;Ign: Lua timing add;"deg",1, 0, -20, 20, 2, @@GAUGE_CATEGORY_TIMING@@
     float luaTimingMult;Ign: Lua timing mult;"deg",1, 0, -20, 20, 2, @@GAUGE_CATEGORY_TIMING@@
 bit luaIgnitionSkip;Ign: Lua Spark Skip
+bit edgeDwellActive;Ign: Edge dwell active
+bit edgeDwellWindowValid;Ign: Edge dwell speed window valid
+bit edgeDwellUnstable;Ign: Edge dwell unstable latch
+bit edgeDwellSparkEdge;Ign: Spark edge-locked (0=legacy)
 
     int16_t autoscale trailingSparkAngle;Ign: Trailing spark deg;"deg",{1/@@PACK_MULT_PERCENT@@},0, -20,20, 2,@@GAUGE_CATEGORY_TIMING@@
     int16_t rpmForIgnitionTableDot;

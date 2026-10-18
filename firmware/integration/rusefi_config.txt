@@ -1863,9 +1863,9 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
 	bit nitrousControlEnabled,"enabled","disabled"
 	bit vvlControlEnabled,"enabled","disabled"
 	bit keepIdleSolenoidWhenStopped,"enabled","disabled";By default the idle solenoid is switched off whenever the engine is not turning, to be quieter and save power. Enable this to keep driving it to the position the idle controller asks for, which at zero RPM is the cranking curve for the current coolant temperature - for valves which need to rest somewhere other than de-energized. The valve is only driven for a minute after the engine stops turning, then switched off anyway to protect the coil and the battery.
-	bit unusedBit_Fancy4
-	bit unusedBit_Fancy5
-	bit unusedBit_Fancy6
+	bit crankingEdgeDwell,"enabled","disabled";Cranking: lock each spark to a trigger tooth (never more advanced than the commanded cranking advance) and time the start of coil charge from recent tooth intervals instead of the once-per-cycle RPM. Active only in the CRANKING state (not spinning-up) and only for events whose commanded advance is 12 degrees BTDC or more; any other event keeps the legacy scheduling. Default disabled = unchanged behaviour.
+	bit edgeDwellPostStartLatch,"enabled","disabled";Right after the switch to RUNNING (first 8 cylinder events only): when the per-cylinder period changes by 18.75 percent or more below 1400 rpm, lock sparks whose commanded advance is 12 degrees BTDC or more to a trigger tooth (at or after the command) for one engine cycle. Independent of the cranking edge dwell bit. Default disabled = unchanged behaviour.
+	bit dwellFixOnRpmUpdate,"enabled","disabled";Keep dwell at the configured time when the once-per-cycle RPM update lands between planning and scheduling of a spark (dwell otherwise scales by old RPM / new RPM). All engine states, legacy path only. Default disabled = unchanged behaviour.
 	bit unusedBit_Fancy7
 	bit unusedBit_Fancy8
 	bit unusedBit_Fancy9
