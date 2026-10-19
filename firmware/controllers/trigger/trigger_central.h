@@ -73,6 +73,12 @@ public:
 	ToothPeriodWindow toothWindow;
 
 	/**
+	 * Sync loss, trigger error, phase re-sync and engine stop: the tooth window starts over AND every ignition event forgets
+	 * which path (legacy or edge) it was scheduled by this cycle, so a pending edge decision cannot outlive the sync it was made on.
+	 */
+	void resetEdgeDwellWindow();
+
+	/**
 	 * Engine phase of trigger event 'eventIndex', computed with exactly the same arithmetic as
 	 * currentEngineDecodedPhase / findNextTriggerToothAngle so that the value is bit-identical to what
 	 * mainTriggerCallback receives for that tooth.

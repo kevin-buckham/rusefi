@@ -284,7 +284,7 @@ void RpmCalculator::setStopSpinning() {
 	}
 	state = STOPPED;
 
-	engine->triggerCentral.toothWindow.reset();
+	engine->triggerCentral.resetEdgeDwellWindow();
 
 	// Broadcast "engine stopped" to all engine modules so they can reset their own state
 	// (trigger sync, instant RPM history, schedulers, etc.). See Engine::onEngineStopped.

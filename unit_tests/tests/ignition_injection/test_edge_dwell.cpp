@@ -657,3 +657,663 @@ TEST(edgeDwell, randomPerStrokeImpulsesUpToThirtyPercentNeverFireEarly) {
 		EXPECT_LE(all.lostPercent(), 6.0) << impulse;
 	}
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Task 8: failure modes. Glitch tooth, window reset, post-start latch (own bit), per-bit identity, mode flips.
+// ---------------------------------------------------------------------------------------------------------------------
+
+TEST(edgeDwell, aGlitchToothCostsAtMostTwoConsecutiveSparksAndIsNeverWorseThanTodayOnAngle) {
+	for (int kind = 0; kind < 2; kind++) {
+		for (int pos = 66; pos < 80; pos++) {
+			double minErr[2] = {99, 99};
+			int noCharge[2] = {0, 0};
+			int consec[2] = {0, 0};
+			size_t sparkCount[2] = {0, 0};
+			for (int on = 0; on < 2; on++) {
+				Profile p = steady(210, 140);
+				p.noise = 0.02f;
+				p.seed = 9;
+				if (kind == 0) {
+					p.missedTooth = pos;
+				} else {
+					p.noiseToothBefore = pos;
+				}
+				Trace t = run(p, on == 1);
+				auto sparks = sparksAfter(t, 60);
+				sparkCount[on] = sparks.size();
+				int streak = 0;
+				for (const Spark& s : sparks) {
+					minErr[on] = std::min(minErr[on], s.errDeg);
+					if (s.dwellMs < 0) {
+						noCharge[on]++;
+						consec[on] = std::max(consec[on], ++streak);
+					} else {
+						streak = 0;
+						EXPECT_LE(s.dwellMs, kBackupMs + 0.1) << (kind ? "noise " : "missed ") << pos;
+					}
+				}
+			}
+			const char* what = kind ? "noise tooth" : "missed tooth";
+			// the 30 deg phase slip a glitch leaves behind is the decoder's, identical with the bit on or off; edge mode must
+			// not make the angle worse than that by more than 2.5 deg: a missing tooth never arrives, so the 3 x dwell backup
+			// (13.5 ms after the charge) fires instead
+			EXPECT_GE(minErr[1], minErr[0] - 2.5) << what << " " << pos;
+			// today every spark keeps its charge because both edges come off one tooth; edge mode may lose some
+			EXPECT_EQ(0, noCharge[0]) << what << " " << pos;
+			EXPECT_LE(noCharge[1], 2) << what << " " << pos;
+			EXPECT_LE(consec[1], 2) << what << " " << pos;
+			EXPECT_LE(std::abs((int)sparkCount[1] - (int)sparkCount[0]), 1) << what << " " << pos;
+		}
+	}
+}
+
+TEST(edgeDwell, withoutAFullSpeedWindowTheSparkIsStillToothLockedAndTheChargeFallsBackToStoredRpm) {
+	std::vector<int> windowValid;
+	std::vector<int> active;
+	Profile p = steady(210, 150);
+	p.noise = 0.02f;
+	p.seed = 3;
+	p.beforeTooth = [](size_t n) {
+		if (n == 90) {
+			// what a trigger error, an engine stop or a phase re-sync does
+			engine->triggerCentral.toothWindow.reset();
+		}
+	};
+	p.afterTooth = [&](size_t) {
+		windowValid.push_back(engine->ignitionState.edgeDwellWindowValid);
+		active.push_back(engine->ignitionState.edgeDwellActive);
+	};
+	Trace t = run(p, true);
+
+	// invalid right after the reset, valid again once 12 intervals (360 deg) have been seen
+	EXPECT_EQ(1, windowValid[89]);
+	EXPECT_EQ(0, windowValid[91]);
+	EXPECT_EQ(0, windowValid[100]);
+	EXPECT_EQ(1, windowValid[103]);
+	// edgeDwellActive is per scheduling tooth (an event is scheduled every 6th tooth), so look at the whole stretch
+	int activeDuring = 0;
+	for (size_t k = 91; k <= 103; k++) {
+		activeDuring += active[k];
+	}
+	EXPECT_GE(activeDuring, 2) << "edge mode stays in use (stored-rpm fallback) while the window refills";
+
+	double tReset = NT2US((double)t.teeth[90].nt);
+	int during = 0;
+	for (const Spark& s : sparksAfter(t, 60)) {
+		EXPECT_NEAR(2.0, s.errDeg, 0.05);
+		if (s.tUs > tReset && s.tUs < tReset + 360000) {
+			during++;
+			EXPECT_GT(s.dwellMs, 0) << "no charge while falling back to stored rpm";
+		}
+	}
+	EXPECT_GE(during, 2);
+}
+
+namespace {
+
+// a start that catches (stored rpm passes cranking.rpm: state RUNNING) and then really falls to 400 rpm while the stored
+// rpm still says 600+: the logged 18:00 start (stored 547, real about 400). decayPerTooth = speed factor per 30 deg tooth.
+Profile postSwitchStart(double decayPerTooth) {
+	Profile p = steady(210, 60);
+	for (double r : {400.0, 600.0, 800.0}) {
+		p.rpm.push_back(r);
+	}
+	for (int i = 0; i < 30; i++) {
+		p.rpm.push_back(800);
+	}
+	double r = 800;
+	for (int i = 0; i < 40; i++) {
+		r = std::max(400.0, r * decayPerTooth);
+		p.rpm.push_back(r);
+	}
+	for (int i = 0; i < 100; i++) {
+		p.rpm.push_back(400);
+	}
+	p.ripple = 0.3f;
+	p.noise = 0.03f;
+	p.seed = 3;
+	return p;
+}
+
+struct PostSwitchRun {
+	Trace trace;
+	std::vector<int> state;
+	std::vector<int> unstable;
+	std::vector<int> sparkEdge;
+	std::vector<float> cachedRpm;
+	std::vector<double> realRpm;
+};
+
+PostSwitchRun runPostSwitch(double decay, bool latch, const std::function<void()>& tweak = nullptr) {
+	PostSwitchRun r;
+	Profile p = postSwitchStart(decay);
+	r.realRpm = p.rpm;
+	p.afterTooth = [&](size_t) {
+		r.state.push_back((int)engine->rpmCalculator.getState());
+		r.unstable.push_back(engine->ignitionState.edgeDwellUnstable);
+		r.sparkEdge.push_back(engine->ignitionState.edgeDwellSparkEdge);
+		r.cachedRpm.push_back(engine->rpmCalculator.getCachedRpm());
+	};
+	Bits bits;
+	bits.latch = latch;
+	r.trace = runTraceBits(p, bits, [&]() {
+		engineConfiguration->fixedTiming = 18.5f;
+		if (tweak) {
+			tweak();
+		}
+	});
+	return r;
+}
+
+size_t toothOfSpark(const Trace& t, const Spark& s) {
+	size_t k = 0;
+	while (k + 1 < t.teeth.size() && NT2US((double)t.teeth[k + 1].nt) <= s.tUs) {
+		k++;
+	}
+	return k;
+}
+
+} // namespace
+
+TEST(edgeDwell, afterTheSwitchToRunningAnAbruptSlowdownNeverGetsASparkMoreAdvancedThanCommanded) {
+	// commanded 18.5 BTDC (the idle value logged at 18:00). Abrupt: speed falls to 0.88 x per tooth (about 53 percent
+	// per 180 deg), the per-cylinder period jumps far more than 18.75 percent and the latch takes over for a cycle.
+	for (double decay : {0.88, 0.80}) {
+		PostSwitchRun off = runPostSwitch(decay, false);
+		PostSwitchRun on = runPostSwitch(decay, true);
+		double offWorst = 99, onWorst = 99;
+		int staleSparksOn = 0;
+		for (const Spark& s : analyze(off.trace)) {
+			size_t k = toothOfSpark(off.trace, s);
+			if (k < off.state.size() && off.state[k] == RUNNING && off.cachedRpm[k] > 1.15 * off.realRpm[k]) {
+				offWorst = std::min(offWorst, s.errDeg);
+			}
+		}
+		for (const Spark& s : analyze(on.trace)) {
+			size_t k = toothOfSpark(on.trace, s);
+			if (k < on.state.size() && on.state[k] == RUNNING && on.cachedRpm[k] > 1.15 * on.realRpm[k]) {
+				staleSparksOn++;
+				onWorst = std::min(onWorst, s.errDeg);
+				EXPECT_GE(s.errDeg, -0.05) << "decay " << decay << " tooth " << k << ": stale-rpm spark more advanced than commanded";
+				EXPECT_EQ(1, on.sparkEdge[k]) << "tooth " << k;
+			}
+		}
+		printf("post-switch decay %.2f: stale-rpm sparks in RUNNING, worst delivered minus commanded: today %.1f deg, edge mode %.1f deg (%d sparks)\n",
+			decay, offWorst, onWorst, staleSparksOn);
+		EXPECT_LE(offWorst, -5.0) << "the scenario must reproduce the early stale-rpm sparks of today's firmware";
+		EXPECT_GE(staleSparksOn, 3) << decay;
+		Integrity i = integrity(on.trace);
+		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << decay;
+		EXPECT_EQ(0, on.trace.sparkOutOfOrder) << decay;
+	}
+}
+
+TEST(edgeDwell, aSlowDecayBelowTheDetectorThresholdIsNotCoveredAndThatIsPinned) {
+	// 0.97 x per tooth (about 17 percent per 180 deg) stays under the 18.75 percent rule: today's early stale-rpm sparks remain.
+	// This is a known limit of the Mitsubishi style detector, listed under Design questions; the test pins it so that
+	// nobody believes the latch covers every stale-rpm case.
+	PostSwitchRun on = runPostSwitch(0.97, true);
+	double worst = 99;
+	for (const Spark& s : analyze(on.trace)) {
+		size_t k = toothOfSpark(on.trace, s);
+		if (k < on.state.size() && on.state[k] == RUNNING && on.cachedRpm[k] > 1.15 * on.realRpm[k]) {
+			worst = std::min(worst, s.errDeg);
+		}
+	}
+	printf("post-switch slow decay 0.97: worst stale-rpm spark with the flag on: %.1f deg vs commanded\n", worst);
+	EXPECT_LT(worst, -5.0);
+}
+
+TEST(edgeDwell, theLiveBitsSayWhichPathScheduledEachSpark) {
+	PostSwitchRun on = runPostSwitch(0.88, true);
+	int unstableTeeth = 0;
+	bool sawEdge = false;
+	bool sawLegacyAfterLatch = false;
+	size_t firstUnstable = 0;
+	for (size_t k = 0; k < on.unstable.size(); k++) {
+		if (on.unstable[k] && !unstableTeeth++) {
+			firstUnstable = k;
+		}
+		sawEdge |= on.sparkEdge[k];
+	}
+	for (size_t k = on.unstable.size() - 30; k < on.unstable.size(); k++) {
+		sawLegacyAfterLatch |= (on.unstable[k] == 0 && on.sparkEdge[k] == 0 && on.state[k] == RUNNING);
+	}
+	EXPECT_GT(unstableTeeth, 24) << "latched for at least one full cycle (24 teeth)";
+	EXPECT_GT(firstUnstable, 55u);
+	EXPECT_TRUE(sawEdge);
+	EXPECT_TRUE(sawLegacyAfterLatch) << "once the latch has released a RUNNING spark is a legacy spark: bit 0";
+}
+
+TEST(edgeDwell, steadyRunningNeverLatchesAndStaysOnTheLegacyPath) {
+	for (double rpm : {800.0, 1000.0, 1200.0}) {
+		for (double ripple : {0.3, 0.5}) {
+			for (int impulseMode = 0; impulseMode < 3; impulseMode++) {
+				for (float shift : {0.0f, 60.0f, 120.0f}) {
+					Profile p = steady(rpm, 300);
+					p.ripple = (float)ripple;
+					p.noise = 0.03f;
+					p.seed = 21;
+					p.tdcShiftDeg = shift;
+					p.impulseMode = impulseMode;
+					p.impulse = 0.05f; // 5 percent per-stroke combustion variation: a rough but healthy idle
+					int latched = 0;
+					int edgeSparks = 0;
+					p.afterTooth = [&](size_t n) {
+						if (n > 30) { // the very first stored-rpm update is allowed to look like a start
+							latched += engine->ignitionState.edgeDwellUnstable;
+							edgeSparks += engine->ignitionState.edgeDwellSparkEdge;
+						}
+					};
+					Bits both;
+					both.edge = true;
+					both.latch = true;
+					Trace t = runTraceBits(p, both);
+					EXPECT_EQ(RUNNING, t.finalState);
+					EXPECT_EQ(0, latched) << rpm << " ripple " << ripple << " impulse mode " << impulseMode << " shift " << shift;
+					EXPECT_EQ(0, edgeSparks) << rpm;
+				}
+			}
+		}
+	}
+}
+
+TEST(edgeDwell, aTipInOrClutchDumpAboveTheThresholdNeverLatches) {
+	for (int variant = 0; variant < 3; variant++) {
+		Profile p = steady(1500, 60);
+		p.ripple = 0.3f;
+		p.noise = 0.03f;
+		p.seed = 4;
+		if (variant == 0) {
+			for (double r : {1900.0, 2500.0, 3200.0, 3600.0}) { // tip-in: 1500 -> 3600 in 4 teeth
+				p.rpm.push_back(r);
+			}
+			for (int i = 0; i < 40; i++) {
+				p.rpm.push_back(3600);
+			}
+		} else if (variant == 1) {
+			for (int i = 0; i < 20; i++) {
+				p.rpm.push_back(3600);
+			}
+			for (double r : {2800.0, 2100.0, 1800.0}) { // clutch dump: 3600 -> 1800 in 3 teeth
+				p.rpm.push_back(r);
+			}
+			for (int i = 0; i < 40; i++) {
+				p.rpm.push_back(1800);
+			}
+		} else {
+			for (int i = 0; i < 24; i++) { // blip: up and straight back down, both above the limit
+				p.rpm.push_back(2400);
+			}
+			for (int i = 0; i < 24; i++) {
+				p.rpm.push_back(1500);
+			}
+		}
+		int latched = 0;
+		p.afterTooth = [&](size_t n) {
+			if (n > 30) {
+				latched += engine->ignitionState.edgeDwellUnstable;
+			}
+		};
+		Bits both;
+		both.edge = true;
+		both.latch = true;
+		Trace t = runTraceBits(p, both);
+		EXPECT_EQ(0, latched) << "variant " << variant;
+		Integrity i = integrity(t);
+		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << variant;
+	}
+}
+
+TEST(edgeDwell, modeFlipsBetweenTheDwellToothAndTheSparkToothNeverDoubleOrStrandACharge) {
+	// the flag is toggled before each of 24 consecutive teeth (every alignment against the four ignition events):
+	// that flips edge <-> legacy between the dwell tooth and the spark tooth of some event, in both directions
+	for (int direction = 0; direction < 2; direction++) {
+		for (int n = 60; n < 84; n++) {
+			Profile p = steady(210, 160);
+			p.ripple = 0.3f;
+			p.noise = 0.03f;
+			p.seed = 5;
+			const bool initial = direction == 0;
+			p.beforeTooth = [n, initial](size_t i) {
+				if ((int)i == n) {
+					engineConfiguration->crankingEdgeDwell = !initial;
+				}
+			};
+			Trace t = runTrace(p, initial);
+			Integrity i = integrity(t);
+			EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << "direction " << direction << " at tooth " << n;
+			EXPECT_EQ(0, i.noCharge) << "direction " << direction << " at tooth " << n;
+			EXPECT_EQ(0, t.sparkOutOfOrder) << "direction " << direction << " at tooth " << n;
+			EXPECT_GE(i.sparks, 21) << "direction " << direction << " at tooth " << n;
+		}
+	}
+}
+
+TEST(edgeDwell, theSwitchToRunningInsideTheFlashKeepsEveryChargeAndSpark) {
+	Profile p = flash();
+	p.noise = 0.03f;
+	p.seed = 777;
+	Trace t = runTrace(p, true);
+	EXPECT_EQ(RUNNING, t.finalState);
+	Integrity i = integrity(t);
+	EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling);
+	EXPECT_EQ(0, t.sparkOutOfOrder);
+}
+
+TEST(edgeDwell, belowTheInstabilityLimitTheRpmUpdateStillNeverShortensDwellMoreThanToday) {
+	// all three bits on, 800 -> 1600 rpm long after the start: the post-start window is closed, so the latch cannot act and
+	// the E4 branch alone governs the dwell. It must not be worse than today's legacy dwell.
+	double worst[2];
+	for (int on = 0; on < 2; on++) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		configureCrank(eth);
+		engineConfiguration->dwellFixOnRpmUpdate = on == 1;
+		engineConfiguration->crankingEdgeDwell = on == 1;
+		engineConfiguration->edgeDwellPostStartLatch = on == 1;
+		setArrayValues(config->sparkDwellValues, 4.0f);
+		Profile p = flash(230);
+		p.rpm.resize(63 + 120, 800);
+		for (double r : {1000.0, 1300.0, 1600.0}) {
+			p.rpm.push_back(r);
+		}
+		for (int i = 0; i < 60; i++) {
+			p.rpm.push_back(1600);
+		}
+		p.ripple = 0.05f;
+		Trace t;
+		drive(eth, t, p);
+		double tRamp = NT2US((double)t.teeth[63 + 120].nt);
+		double w = 9;
+		for (const Spark& s : analyze(t)) {
+			if (s.tUs > tRamp && s.tUs < tRamp + 120000 && s.dwellMs > 0) {
+				w = std::min(w, s.dwellMs / 4.0);
+			}
+		}
+		worst[on] = w;
+	}
+	printf("E4b worst actual/4ms dwell across the 800->1600 rpm update: flag off %.2f, on %.2f\n", worst[0], worst[1]);
+	EXPECT_GE(worst[1], worst[0] - 0.02);
+}
+
+namespace {
+
+// start that flashes to 800 at tooth 60-63 and then idles. The stored rpm (updated once per 720 deg) passes cranking.rpm at
+// the next cycle boundary, so the CRANKING->RUNNING switch happens a few teeth later: it is MEASURED, not assumed. The
+// post-start window is 8 cylinder events = 48 teeth (kWindowTeeth) after that switch.
+constexpr int kWindowTeeth = 48;
+
+Profile startThenIdle(int teethAfterSwitch) {
+	Profile p = flash();
+	p.rpm.resize(63 + teethAfterSwitch, 800);
+	p.ripple = 0.3f;
+	p.noise = 0.03f;
+	p.seed = 31;
+	return p;
+}
+
+// tooth index at which the state first reads RUNNING for the start profile (independent of any bit). Measured in a
+// standalone run BEFORE any test run (fixture SetUp), never from inside another run.
+size_t measureSwitchTooth() {
+	Profile p = startThenIdle(100);
+	size_t first = 0;
+	p.afterTooth = [&](size_t n) {
+		if (!first && engine->rpmCalculator.getState() == RUNNING) {
+			first = n;
+		}
+	};
+	runTraceBits(p, Bits());
+	return first;
+}
+
+struct LatchObs {
+	int unstableOutside = 0;
+	int edgeOutside = 0;
+	int unstableInside = 0;
+	int running = 0;
+};
+
+LatchObs observeLatch(Profile& p, const Bits& bits, size_t switchAt) {
+	LatchObs o;
+	p.afterTooth = [&](size_t n) {
+		if (engine->rpmCalculator.getState() == RUNNING) {
+			o.running++;
+		}
+		if (n >= switchAt + kWindowTeeth + 2) {
+			o.unstableOutside += engine->ignitionState.edgeDwellUnstable;
+			o.edgeOutside += engine->ignitionState.edgeDwellActive;
+		} else {
+			o.unstableInside += engine->ignitionState.edgeDwellUnstable;
+		}
+	};
+	runTraceBits(p, bits);
+	return o;
+}
+
+} // namespace
+
+class edgeDwellPostStart : public ::testing::Test {
+protected:
+	void SetUp() override {
+		sw = measureSwitchTooth();
+	}
+	size_t sw = 0;
+};
+
+TEST_F(edgeDwellPostStart, theMeasuredSwitchToothIsAfterTheFlashAndLongBeforeTheWindowEnds) {
+	EXPECT_GT(sw, 63u);
+	EXPECT_LT(sw, 63u + 60u);
+}
+
+TEST_F(edgeDwellPostStart, theLatchNeverActsOutsideThePostStartWindowOnASagAndCatchIdle) {
+	// idle 800 -> 320 -> 800 rpm long after the start (the stored rpm lags the sag exactly like at the 18:00 start): a real
+	// speed step, the latch must stay out because the post-start window is over
+	for (double bottom : {320.0, 450.0}) {
+		Profile p = startThenIdle(100);
+		for (double r : {650.0, 500.0, bottom}) {
+			p.rpm.push_back(r);
+		}
+		for (int i = 0; i < 18; i++) {
+			p.rpm.push_back(bottom);
+		}
+		for (double r : {500.0, 650.0}) {
+			p.rpm.push_back(r);
+		}
+		for (int i = 0; i < 60; i++) {
+			p.rpm.push_back(800);
+		}
+		// the sag starts after the window: 100 teeth of idle after the flash is later than the measured switch + 48
+		ASSERT_GT(63u + 100u, sw + kWindowTeeth);
+		Bits bits;
+		bits.edge = true;
+		bits.latch = true;
+		LatchObs o = observeLatch(p, bits, sw);
+		EXPECT_EQ(0, o.unstableOutside) << "bottom " << bottom;
+		EXPECT_EQ(0, o.edgeOutside) << "bottom " << bottom << ": RUNNING spark scheduled by the edge path outside the window";
+	}
+}
+
+TEST_F(edgeDwellPostStart, theLatchNeverActsOutsideThePostStartWindowOnAnIdleMisfireOfTenToTwentyPercent) {
+	for (int impulseMode : {1, 2}) {
+		for (float impulse : {0.10f, 0.15f, 0.20f}) {
+			for (float shift : {0.0f, 60.0f, 120.0f}) {
+				Profile p = startThenIdle(220);
+				p.impulseMode = impulseMode;
+				p.impulse = impulse;
+				p.tdcShiftDeg = shift;
+				Bits bits;
+				bits.edge = true;
+				bits.latch = true;
+				LatchObs o = observeLatch(p, bits, sw);
+				EXPECT_EQ(0, o.unstableOutside) << "mode " << impulseMode << " impulse " << impulse << " shift " << shift;
+				EXPECT_EQ(0, o.edgeOutside) << "mode " << impulseMode << " impulse " << impulse << " shift " << shift;
+			}
+		}
+	}
+}
+
+TEST_F(edgeDwellPostStart, theLatchWindowClosesAfterEightCylinderEventsNotBefore) {
+	// the same abrupt step injected at different distances after the switch: inside 48 teeth it latches, after it never does
+	auto stepRun = [&](int stepAfter) {
+		Profile p = startThenIdle(60);
+		p.rpm.resize(sw + stepAfter, 800);
+		for (int i = 0; i < 30; i++) {
+			p.rpm.push_back(400);
+		}
+		for (int i = 0; i < 60; i++) {
+			p.rpm.push_back(800);
+		}
+		Bits bits;
+		bits.latch = true;
+		bool any = false;
+		p.afterTooth = [&](size_t) { any |= engine->ignitionState.edgeDwellUnstable; };
+		runTraceBits(p, bits);
+		return any;
+	};
+	for (int stepAfter : {5, 20, 40}) {
+		EXPECT_TRUE(stepRun(stepAfter)) << "a step " << stepAfter << " teeth after the switch must latch";
+	}
+	for (int stepAfter : {60, 90}) {
+		EXPECT_FALSE(stepRun(stepAfter)) << "step " << stepAfter << " teeth after the switch is outside the window";
+	}
+}
+
+TEST(edgeDwell, inTheWindowARunningCommandBelowTwelveUsesTheLegacyPathNotThe18AtdcTooth) {
+	// the logged 18:00 slowdown with idle timing 10 BTDC: the latch trips, but the commanded advance is below 12, so every
+	// event keeps today's path: the coil edges are bit-identical to the same run with the latch bit off
+	for (double decay : {0.88, 0.80}) {
+		PostSwitchRun on = runPostSwitch(decay, true, []() { engineConfiguration->fixedTiming = 10.0f; });
+		PostSwitchRun off = runPostSwitch(decay, false, []() { engineConfiguration->fixedTiming = 10.0f; });
+		int unstable = 0;
+		for (size_t k = 0; k < on.unstable.size(); k++) {
+			unstable += on.unstable[k];
+		}
+		EXPECT_GT(unstable, 24) << "the detector must still trip (it is the event gate that keeps the legacy path)";
+		EXPECT_EQ(coilFingerprint(off.trace), coilFingerprint(on.trace)) << decay;
+		EXPECT_EQ(off.trace.coils.size(), on.trace.coils.size());
+	}
+}
+
+TEST(edgeDwell, eachBitIsAnIdentityOnItsOwnTerritoryWhenOffAndNeverReachesIntoTheOthers) {
+	// (a) crankingEdgeDwell off, the other two on: a pure cranking trace is today's coil schedule, edge never active
+	{
+		Profile p = steady(210, 100);
+		p.noise = 0.03f;
+		p.seed = 1;
+		Bits others;
+		others.latch = true;
+		others.e4 = true;
+		bool anyEdge = false;
+		p.afterTooth = [&](size_t) { anyEdge |= engine->ignitionState.edgeDwellActive; };
+		Trace a = runTraceBits(p, others);
+		p.afterTooth = nullptr;
+		Bits e4Only;
+		e4Only.e4 = true;
+		Trace ref = runTraceBits(p, e4Only); // the latch bit is inert before the switch to RUNNING
+		Trace off = runTrace(p, false);
+		EXPECT_FALSE(anyEdge);
+		EXPECT_EQ(coilFingerprint(ref), coilFingerprint(a)) << "with the cranking bit off, the latch bit must not change a pure cranking run";
+		// and with only the latch bit set, the pure cranking run IS today's schedule
+		Bits latchOnly;
+		latchOnly.latch = true;
+		EXPECT_EQ(coilFingerprint(off), coilFingerprint(runTraceBits(p, latchOnly)));
+	}
+	// (b) latch off, the other two on: after the switch to RUNNING the latch never raises and edge is not active in RUNNING
+	{
+		for (double decay : {0.88, 0.80}) {
+			Profile p = postSwitchStart(decay);
+			Bits others;
+			others.edge = true;
+			others.e4 = true;
+			int unstable = 0;
+			int activeRunning = 0;
+			p.afterTooth = [&](size_t) {
+				unstable += engine->ignitionState.edgeDwellUnstable;
+				activeRunning += engine->rpmCalculator.getState() == RUNNING && engine->ignitionState.edgeDwellActive;
+			};
+			runTraceBits(p, others, []() { engineConfiguration->fixedTiming = 18.5f; });
+			EXPECT_EQ(0, unstable) << decay;
+			EXPECT_EQ(0, activeRunning) << decay;
+		}
+	}
+	// (c) E4 off, the other two on: a smooth speed-up reproduces today's dwell collapse (E4 is the only thing that fixes it)
+	{
+		double worst[2];
+		for (int e4 = 0; e4 < 2; e4++) {
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			configureCrank(eth);
+			engineConfiguration->crankingEdgeDwell = true;
+			engineConfiguration->edgeDwellPostStartLatch = true;
+			engineConfiguration->dwellFixOnRpmUpdate = e4 == 1;
+			setArrayValues(config->sparkDwellValues, 4.0f);
+			Profile p = steady(1000, 80);
+			double r = 1000;
+			for (int i = 0; i < 100; i++) {
+				r *= 1.01;
+				p.rpm.push_back(r);
+			}
+			for (int i = 0; i < 60; i++) {
+				p.rpm.push_back(r);
+			}
+			p.ripple = 0.05f;
+			Trace t;
+			drive(eth, t, p);
+			double w = 9;
+			for (const Spark& s : analyze(t)) {
+				if (s.tUs > NT2US((double)t.teeth[90].nt) && s.dwellMs > 0) {
+					w = std::min(w, s.dwellMs / 4.0);
+				}
+			}
+			worst[e4] = w;
+		}
+		printf("E4 identity: worst dwell ratio with E4 off %.2f, on %.2f (other two bits on)\n", worst[0], worst[1]);
+		EXPECT_LT(worst[0], 0.65);
+		EXPECT_GT(worst[1], worst[0] + 0.15);
+	}
+}
+
+TEST(edgeDwell, aSyncLossBetweenTheLegacyDwellToothAndTheEdgeDwellToothClearsThePendingEdgeDecision) {
+	// an event the edge path has only half scheduled (edgeDwellCycleState 2) must not survive a trigger error: with the bits
+	// off afterwards the next cycle takes the legacy path for every event (no edge spark, states back to 0)
+	Profile p = steady(210, 200);
+	p.noise = 0.02f;
+	p.seed = 11;
+	bool injected = false;
+	size_t injectedAt = 0;
+	int pendingAfter = -1;
+	int edgeSparksAfter = 0;
+	p.beforeTooth = [&](size_t n) {
+		if (injected || n < 70) {
+			return;
+		}
+		bool pending = false;
+		for (size_t i = 0; i < efi::size(getIgnitionEvents()->elements); i++) {
+			pending |= getIgnitionEvents()->elements[i].edgeDwellCycleState == 2;
+		}
+		if (pending) {
+			injected = true;
+			injectedAt = n;
+			engineConfiguration->crankingEdgeDwell = false;
+			engine->triggerCentral.triggerState.onTriggerError();
+			pendingAfter = 0;
+			for (size_t i = 0; i < efi::size(getIgnitionEvents()->elements); i++) {
+				pendingAfter += getIgnitionEvents()->elements[i].edgeDwellCycleState == 2;
+			}
+		}
+	};
+	p.afterTooth = [&](size_t n) {
+		if (injected && n > injectedAt) {
+			edgeSparksAfter += engine->ignitionState.edgeDwellSparkEdge;
+			for (size_t i = 0; i < efi::size(getIgnitionEvents()->elements); i++) {
+				EXPECT_NE(2, getIgnitionEvents()->elements[i].edgeDwellCycleState) << "tooth " << n;
+			}
+		}
+	};
+	// a large command (38 BTDC) makes the edge dwell tooth later than the legacy one, so an event sits at state 2 between teeth
+	Trace t = runTrace(p, true, []() { engineConfiguration->fixedTiming = 38.0f; });
+	ASSERT_TRUE(injected) << "the scenario never produced a pending edge event";
+	EXPECT_EQ(0, pendingAfter);
+	EXPECT_EQ(0, edgeSparksAfter);
+	Integrity i = integrity(t);
+	EXPECT_EQ(0, i.doubleCharge + i.doubleSpark);
+}

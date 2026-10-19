@@ -137,6 +137,14 @@ static bool vvtWithRealDecoder(vvt_mode_e vvtMode) {
 			&& vvtMode != VVT_SINGLE_TOOTH;
 }
 
+void TriggerCentral::resetEdgeDwellWindow() {
+	toothWindow.reset();
+	IgnitionEventList* events = getIgnitionEvents();
+	for (size_t i = 0; i < efi::size(events->elements); i++) {
+		events->elements[i].edgeDwellCycleState = 0;
+	}
+}
+
 angle_t TriggerCentral::syncEnginePhaseAndReport(int divider, int remainder) {
 	angle_t engineCycle = getEngineCycle(getEngineRotationState()->getOperationMode());
 
@@ -148,7 +156,7 @@ angle_t TriggerCentral::syncEnginePhaseAndReport(int divider, int remainder) {
 
 		instantRpm.offsetIndices(indexOffset);
 		// tooth phases just jumped by totalShift: intervals recorded before the jump are mislabelled
-		toothWindow.reset();
+		resetEdgeDwellWindow();
 
 		// Adjust phase-dependent variables
 		if (expectedNextPhase) {
@@ -1015,7 +1023,7 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 		boardTriggerCallback(timestamp, currentEngineDecodedPhase);
 	} else {
 		// without sync tooth phases mean nothing: the speed window must start over
-		toothWindow.reset();
+		resetEdgeDwellWindow();
 
 		// We don't have sync, but report to the wave chart anyway as index 0.
 		reportEventToWaveChart(signal, 0, triggerShape.useOnlyRisingEdges);

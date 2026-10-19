@@ -682,11 +682,12 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 		engine->ignitionState.edgeDwellActive = false;
 		engine->ignitionState.edgeDwellUnstable = unstableLatched;
 		engine->ignitionState.edgeDwellWindowValid = edgeModeAllowed && getTriggerCentral()->toothWindow.slowUsPerDeg(360) > 0;
-	} else if (engine->ignitionState.edgeDwellActive || engine->ignitionState.edgeDwellUnstable || engine->ignitionState.edgeDwellWindowValid) {
+	} else if (engine->ignitionState.edgeDwellActive || engine->ignitionState.edgeDwellUnstable || engine->ignitionState.edgeDwellWindowValid || engine->ignitionState.edgeDwellSparkEdge) {
 		// a bit was switched off while the live bits were up: lower them (no behavioural effect)
 		engine->ignitionState.edgeDwellActive = false;
 		engine->ignitionState.edgeDwellUnstable = false;
 		engine->ignitionState.edgeDwellWindowValid = false;
+		engine->ignitionState.edgeDwellSparkEdge = false;
 	}
 
 	if (engine->ignitionEvents.isReady) {
