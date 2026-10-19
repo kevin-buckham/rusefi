@@ -190,11 +190,9 @@ void RpmCalculator::setRpmValue(float value) {
 			engineStartTimer.reset();
 			// post-start instability window of the edge-dwell scheduler (own bit, default off)
 			if (engineConfiguration->edgeDwellPostStartLatch) {
-				{
 				const float cycleDeg = getEngineState()->engineCycle;
 				const int cyl = engineConfiguration->cylindersCount;
 				engine->triggerCentral.toothWindow.markPostStart(cyl > 0 ? edgedwell::kPostStartWindowEvents * cycleDeg / cyl : 0);
-			}
 			}
 		}
 

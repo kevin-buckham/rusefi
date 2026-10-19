@@ -1365,3 +1365,132 @@ TEST(edgeDwell, aSyncLossBetweenTheLegacyDwellToothAndTheEdgeDwellToothClearsThe
 	EXPECT_EQ(y.coils.size(), x.coils.size());
 	EXPECT_EQ(coilFingerprint(y), coilFingerprint(x)) << "after a sync loss the edge path must not leave a trace";
 }
+
+namespace {
+
+// A phase re-sync / trigger error / bit-on reset between an event's LEGACY schedule (edgeDwellCycleState 1) and its spark must
+// leave that event on the legacy path: re-planning it onto the edge path could not re-insert its pending dwellStartTimer, the old
+// charge would stay while the spark moved to the edge tooth, and the backup would be computed from a charge time that never
+// took effect (dwell > 3x, unplanned spark angle).
+void legacyScheduledThenReset(int mode) {
+	Profile p = steady(210, 200);
+	p.ripple = 0;
+	p.noise = 0.02f;
+	p.seed = 5;
+	Profile refP = p;
+	bool injected = false;
+	size_t injectedAt = 0;
+	int ownedBefore = -1;
+	int stateAfter = -1;
+	int64_t sparked[MAX_CYLINDER_COUNT];
+	std::fill(std::begin(sparked), std::end(sparked), -1);
+	p.beforeTooth = [&](size_t n) {
+		if (n == 0) {
+			// per-cylinder counter of the last spark fired, on top of the harness recorder: an event is outstanding while
+			// it has been scheduled (counter assigned) and its spark has not fired
+			auto record = engine->onIgnitionEvent;
+			engine->onIgnitionEvent = [&sparked, record](IgnitionEvent* e, bool state) {
+				if (!state) {
+					sparked[e->cylinderIndex] = e->sparkCounter;
+				}
+				record(e, state);
+			};
+		}
+		if (injected || n < 70) {
+			return;
+		}
+		int owned = -1;
+		for (size_t i = 0; i < efi::size(getIgnitionEvents()->elements); i++) {
+			if (getIgnitionEvents()->elements[i].edgeDwellCycleState == 1 && sparked[i] != (int64_t)getIgnitionEvents()->elements[i].sparkCounter) {
+				owned = (int)i;
+			}
+		}
+		if (owned < 0) {
+			return;
+		}
+		injected = true;
+		injectedAt = n;
+		ownedBefore = owned;
+		// the bit goes on (an eligible 14 BTDC command) in the same tick as the reset
+		engineConfiguration->crankingEdgeDwell = true;
+		if (mode == 0) {
+			engine->triggerCentral.resetEdgeDwellWindow(); // what syncEnginePhaseAndReport / sync loss / stop do
+		} else {
+			engine->triggerCentral.triggerState.onTriggerError();
+		}
+		stateAfter = getIgnitionEvents()->elements[owned].edgeDwellCycleState;
+	};
+	Trace t = runTrace(p, false);
+	ASSERT_TRUE(injected) << "no legacy-owned event found";
+	EXPECT_GE(ownedBefore, 0);
+	EXPECT_EQ(1, stateAfter) << "a reset must not hand a legacy-scheduled event to the edge path";
+	Integrity i = integrity(t);
+	EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling);
+	EXPECT_EQ(0, t.sparkOutOfOrder);
+	auto sparks = analyze(t);
+	// the spark the reset caught is the first spark edge after the injection tooth
+	efitick_t at = t.teeth[injectedAt - 1].nt; // beforeTooth(n) runs before tooth n is delivered
+	int ordinal = 0;
+	for (const Coil& c : t.coils) {
+		if (!c.charge && c.nt <= at) {
+			ordinal++;
+		}
+	}
+	ASSERT_GT(sparks.size(), (size_t)ordinal + 1);
+	for (size_t k = ordinal; k < sparks.size(); k++) {
+		EXPECT_LE(sparks[k].dwellMs, 3 * 4.5 + 0.1) << "spark " << k;
+	}
+	if (mode == 0) {
+		// the same run with the bit never on: the outstanding spark is bit-for-bit today's (time and angle)
+		Trace ref = runTrace(refP, false);
+		auto b = analyze(ref);
+		ASSERT_GT(b.size(), (size_t)ordinal + 1);
+		EXPECT_NEAR(b[ordinal].tUs, sparks[ordinal].tUs, 1.0);
+		EXPECT_NEAR(b[ordinal].errDeg, sparks[ordinal].errDeg, 0.05);
+		EXPECT_NEAR(b[ordinal].dwellMs, sparks[ordinal].dwellMs, 0.01);
+	}
+	// edge sparks never run earlier than commanded afterwards
+	for (size_t k = ordinal + 1; k < sparks.size(); k++) {
+		EXPECT_GE(sparks[k].errDeg, -0.06) << "spark " << k;
+	}
+}
+
+} // namespace
+
+TEST(edgeDwell, aPhaseResyncBetweenALegacyScheduleAndItsSparkLeavesTheEventOnTheLegacyPath) {
+	legacyScheduledThenReset(0);
+}
+
+TEST(edgeDwell, aTriggerErrorBetweenALegacyScheduleAndItsSparkLeavesTheEventOnTheLegacyPath) {
+	legacyScheduledThenReset(1);
+}
+
+TEST(edgeDwell, switchingABitOffToOnResetsTheWindowButNotALegacyOwnedEvent) {
+	for (int which = 0; which < 2; which++) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		configureCrank(eth);
+		engineConfiguration->crankingEdgeDwell = which == 0;
+		engineConfiguration->edgeDwellPostStartLatch = which == 1;
+		Profile p = steady(210, 70);
+		Trace t;
+		drive(eth, t, p);
+		ASSERT_GT(engine->triggerCentral.toothWindow.slowUsPerDeg(360), 0) << which;
+		// both bits off: the window is no longer fed
+		engineConfiguration->crankingEdgeDwell = false;
+		engineConfiguration->edgeDwellPostStartLatch = false;
+		Profile off = steady(210, 8);
+		drive(eth, t, off);
+		ASSERT_GT(engine->triggerCentral.toothWindow.slowUsPerDeg(360), 0) << which;
+		// mark an event legacy-owned, then turn the bit on: window cleared, owned state untouched
+		getIgnitionEvents()->elements[0].edgeDwellCycleState = 1;
+		getIgnitionEvents()->elements[1].edgeDwellCycleState = 2;
+		engineConfiguration->crankingEdgeDwell = which == 0;
+		engineConfiguration->edgeDwellPostStartLatch = which == 1;
+		eth.moveTimeForwardAndInvokeEventsUs(5000);
+		eth.firePrimaryTriggerRise();
+		// the reset happened before this tooth was recorded: one tooth, so no 360 deg of history
+		EXPECT_EQ(0, engine->triggerCentral.toothWindow.slowUsPerDeg(360)) << which;
+		EXPECT_EQ(1, getIgnitionEvents()->elements[0].edgeDwellCycleState) << which;
+		EXPECT_NE(2, getIgnitionEvents()->elements[1].edgeDwellCycleState) << which;
+	}
+}

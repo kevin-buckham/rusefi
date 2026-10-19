@@ -3,6 +3,7 @@
 #include "edge_dwell.h"
 
 #include <array>
+#include <limits>
 
 using namespace edgedwell;
 
@@ -176,4 +177,38 @@ TEST(edgeDwellMath, theInstabilityConstantsAreTheMitsubishiOnesAndMatchTheWindow
 	EXPECT_EQ(3.0f, kEdgeOverdwellFactor);
 	EXPECT_EQ(12.0f, kEdgeMinAdvanceDeg);
 	EXPECT_EQ(8, kPostStartWindowEvents);
+}
+
+TEST(edgeDwellMath, forwardDistanceNeverHangsOnNonFiniteInputOrANonPositiveCycle) {
+	const float nan = std::nanf("");
+	const float inf = std::numeric_limits<float>::infinity();
+	EXPECT_EQ(0, forwardDistance(nan, 10, 720));
+	EXPECT_EQ(0, forwardDistance(10, inf, 720));
+	EXPECT_EQ(0, forwardDistance(10, 20, 0));
+	EXPECT_EQ(0, forwardDistance(10, 20, -720));
+	EXPECT_EQ(0, forwardDistance(10, 20, nan));
+	EXPECT_EQ(0, forwardDistance(10, 20, inf));
+	EXPECT_NEAR(710, forwardDistance(20, 10, 720), 1e-3);
+	EXPECT_NEAR(10, forwardDistance(10, 20, 720), 1e-3);
+}
+
+TEST(edgeDwellMath, nonFiniteInputsRefuseTheEdgeChargeInsteadOfChargingNow) {
+	const float nan = std::nanf("");
+	// a NaN delay used to fall through to 0 = charge at the dwell tooth (up to ~28 ms lead-in at 210 rpm: early backup spark)
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(nan, 4.5f, 0, 1000, 800, 800));
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(30, nan, 30000, 1000, 800, 800));
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(-5, 4.5f, 0, 1000, 800, 800));
+	// no usable speed at all
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(30, 4.5f, 0, 0, 0, nan));
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(30, 4.5f, 0, nan, nan, nan));
+	EXPECT_EQ(kRefuseCharge, dwellStartDelayUs(30, 4.5f, nan, 0, 0, 0));
+	// a NaN OPTIONAL input is "unavailable": the next tier answers
+	EXPECT_NEAR(30 * 800 - 4500, dwellStartDelayUs(30, 4.5f, nan, nan, nan, 800), 1);
+	EXPECT_NEAR(30 * 1000 - 4500, dwellStartDelayUs(30, 4.5f, 0, 1000, nan, 800), 1);
+	// the pre-check the scheduler uses agrees
+	EXPECT_FALSE(chargeInputsUsable(nan, 4.5f, 1000, 800, 800));
+	EXPECT_FALSE(chargeInputsUsable(30, 4.5f, 0, 0, 0));
+	EXPECT_TRUE(chargeInputsUsable(30, 4.5f, 0, 0, 800));
+	// good inputs are never refused
+	EXPECT_GE(dwellStartDelayUs(30, 4.5f, 3000, 0, 0, 800), 0);
 }

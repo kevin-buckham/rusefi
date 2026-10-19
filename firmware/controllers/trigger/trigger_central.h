@@ -71,6 +71,8 @@ public:
 	 * Fed from handleShaftSignal() while that flag is set; never read by RPM, fuel or the state machine.
 	 */
 	ToothPeriodWindow toothWindow;
+	// previous state of crankingEdgeDwell / edgeDwellPostStartLatch as seen by handleShaftSignal (off -> on resets the window)
+	bool m_edgeDwellBitWasOn[2] = {false, false};
 
 	/**
 	 * Sync loss, trigger error, phase re-sync and engine stop: the tooth window starts over AND every ignition event forgets

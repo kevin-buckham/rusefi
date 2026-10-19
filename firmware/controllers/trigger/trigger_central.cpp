@@ -141,7 +141,12 @@ void TriggerCentral::resetEdgeDwellWindow() {
 	toothWindow.reset();
 	IgnitionEventList* events = getIgnitionEvents();
 	for (size_t i = 0; i < efi::size(events->elements); i++) {
-		events->elements[i].edgeDwellCycleState = 0;
+		// only an edge-pending decision (2) is dropped; state 1 means the legacy path already scheduled this event's charge
+		// and it must stay on the legacy path until its spark (re-planning it onto the edge path could not re-insert the
+		// pending dwell timer and would compute the backup from a charge that never took effect)
+		if (events->elements[i].edgeDwellCycleState == 2) {
+			events->elements[i].edgeDwellCycleState = 0;
+		}
 	}
 }
 
@@ -972,6 +977,14 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 
 		// Cranking edge-dwell: record this tooth's interval (both bits off = no work, no state)
 		if (engineConfiguration->crankingEdgeDwell || engineConfiguration->edgeDwellPostStartLatch) {
+			// a bit switched off -> on mid-run: the window holds stale (or no) intervals, start over (pending edge decisions
+			// drop, a legacy-owned event keeps its path, see resetEdgeDwellWindow)
+			if ((engineConfiguration->crankingEdgeDwell && !m_edgeDwellBitWasOn[0])
+					|| (engineConfiguration->edgeDwellPostStartLatch && !m_edgeDwellBitWasOn[1])) {
+				resetEdgeDwellWindow();
+			}
+			m_edgeDwellBitWasOn[0] = engineConfiguration->crankingEdgeDwell;
+			m_edgeDwellBitWasOn[1] = engineConfiguration->edgeDwellPostStartLatch;
 			const float cycleDeg = getEngineState()->engineCycle;
 			toothWindow.onTooth(timestamp, currentEngineDecodedPhase, cycleDeg);
 			// the instability detector runs only in the post-start window, and only with its own bit
@@ -981,6 +994,8 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 					toothWindow.evaluateInstability(strokeDeg, cycleDeg, edgedwell::kInstabilityRatio, edgedwell::kInstabilityRpm);
 				}
 			}
+		} else if (m_edgeDwellBitWasOn[0] || m_edgeDwellBitWasOn[1]) {
+			m_edgeDwellBitWasOn[0] = m_edgeDwellBitWasOn[1] = false;
 		}
 
 		// Update engine RPM

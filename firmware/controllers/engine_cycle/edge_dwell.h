@@ -56,12 +56,16 @@ constexpr float kSlowBias = 1.0f;
 constexpr float kTier1CapFactor = 2.0f;
 
 inline float forwardDistance(float from, float to, float cycleDeg) {
-	float d = to - from;
-	while (d < 0) {
+	// guarded like ToothPeriodWindow::forwardDistance: non-finite input or a non-positive cycle returns 0 (no loop to hang)
+	if (!(cycleDeg > 0) || !std::isfinite(cycleDeg) || !std::isfinite(from) || !std::isfinite(to)) {
+		return 0;
+	}
+	float d = fmodf(to - from, cycleDeg);
+	if (d < 0) {
 		d += cycleDeg;
 	}
-	while (d >= cycleDeg) {
-		d -= cycleDeg;
+	if (d >= cycleDeg) {
+		d = 0;
 	}
 	return d;
 }
@@ -166,10 +170,41 @@ Plan planForEvent(PhaseAt phaseAt, size_t count, float cycleDeg, float commanded
  * @param lastUsPerDeg us/deg of the most recent tooth interval, 0 if unknown
  * @param storedUsPerDeg us/deg from the stored 720-deg RPM
  *
- * The result is never negative: when the arithmetic says the charge should already have started, it starts right
- * at the dwell tooth (shortest safe dwell that still has a chance to spark) rather than being skipped.
+ * The result is never negative unless refused: when the arithmetic says the charge should already have started, it
+ * starts right at the dwell tooth (shortest safe dwell that still has a chance to spark) rather than being skipped.
+ *
+ * Refusal (kRefuseCharge, -1): the inputs cannot produce a trustworthy finite delay (NaN/inf remaining degrees or dwell,
+ * or no usable speed at all, or a non-finite result). A NaN used to fall through to 0 = "charge now", i.e. up to ~28 ms
+ * of lead-in at 210 rpm against a 13.5 ms over-dwell backup (an early spark). The caller must then keep the event on the
+ * legacy path (see chargeInputsUsable, checked before the edge plan is accepted). Non-finite OPTIONAL inputs (predictedUs,
+ * slowUsPerDeg, lastUsPerDeg) are treated as "unavailable" (0) and the next tier is used.
  */
+constexpr float kRefuseCharge = -1.0f;
+
+inline bool chargeInputsUsable(float remainingDeg, float dwellMs, float slowUsPerDeg, float lastUsPerDeg, float storedUsPerDeg) {
+	if (!std::isfinite(remainingDeg) || remainingDeg < 0 || !std::isfinite(dwellMs) || dwellMs < 0) {
+		return false;
+	}
+	auto ok = [](float v) { return std::isfinite(v) && v > 0; };
+	return ok(slowUsPerDeg) || ok(lastUsPerDeg) || ok(storedUsPerDeg);
+}
+
 inline float dwellStartDelayUs(float remainingDeg, float dwellMs, float predictedUs, float slowUsPerDeg, float lastUsPerDeg, float storedUsPerDeg) {
+	if (!std::isfinite(predictedUs)) {
+		predictedUs = 0;
+	}
+	if (!std::isfinite(slowUsPerDeg)) {
+		slowUsPerDeg = 0;
+	}
+	if (!std::isfinite(lastUsPerDeg)) {
+		lastUsPerDeg = 0;
+	}
+	if (!std::isfinite(storedUsPerDeg)) {
+		storedUsPerDeg = 0;
+	}
+	if (!chargeInputsUsable(remainingDeg, dwellMs, slowUsPerDeg, lastUsPerDeg, storedUsPerDeg)) {
+		return kRefuseCharge;
+	}
 	float dwellUs = dwellMs * 1000.0f;
 	if (predictedUs > 0) {
 		// stroke-twin prediction (already extrapolated for a decelerating crank, see ToothPeriodWindow::predictTimeUs).
@@ -184,7 +219,7 @@ inline float dwellStartDelayUs(float remainingDeg, float dwellMs, float predicte
 		// right; the REAL dwell is bounded by the sweeps). A separate 2 x dwell lower bound on the delay was removed: it is
 		// arithmetically unreachable (t - dwellUs >= t - 2 x dwellUs for any dwellUs >= 0).
 		float d = t - dwellUs;
-		return d > 0 ? d : 0;
+		return d > 0 ? d : (d == d ? 0 : kRefuseCharge);
 	}
 	float usPerDeg = slowUsPerDeg > 0 ? slowUsPerDeg : storedUsPerDeg;
 	float delay = remainingDeg * usPerDeg - dwellUs;
@@ -193,6 +228,9 @@ inline float dwellStartDelayUs(float remainingDeg, float dwellMs, float predicte
 		if (delay > guard) {
 			delay = guard;
 		}
+	}
+	if (!std::isfinite(delay)) {
+		return kRefuseCharge;
 	}
 	return delay > 0 ? delay : 0;
 }

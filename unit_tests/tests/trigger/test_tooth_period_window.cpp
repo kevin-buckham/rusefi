@@ -159,13 +159,15 @@ TEST(toothPeriodWindow, periodUsSumsExactlyOneStrokeAndRefusesAnythingElse) {
 
 namespace {
 
+constexpr double kPi = 3.14159265358979323846; // M_PI is not defined by strict -std=c++20 on every host
+
 // us/deg of a 12 tooth wheel at 'rpm', with ripple (fraction) repeating every 180 deg and per-interval jitter (fraction)
 double usPerDegAt(double rpm, int k, double ripple, double jitter, uint32_t& seed) {
 	double base = 60e6 / (rpm * 360.0);
 	double mid = 18.0 + 30.0 * k - 15.0;
 	seed = seed * 1664525u + 1013904223u;
 	double j = ((seed >> 8) & 0xFFFF) / 65535.0 * 2 - 1;
-	return base * (1.0 - ripple * std::cos(2 * M_PI * mid / 180.0)) * (1.0 + jitter * j);
+	return base * (1.0 - ripple * std::cos(2 * kPi * mid / 180.0)) * (1.0 + jitter * j);
 }
 
 struct InstabilityRun {

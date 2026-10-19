@@ -21,6 +21,8 @@
 
 namespace edgetest {
 
+constexpr double kPi = 3.14159265358979323846; // M_PI is not defined by strict -std=c++20 on every host
+
 struct Tooth {
 	efitick_t nt;
 	float phase;
@@ -117,7 +119,7 @@ inline void drive(EngineTestHelper& eth, Trace& t, const Profile& p) {
 		}
 		float nextPhase = t.teeth.empty() ? 0.0f : std::fmod(phase + 30.0f, 720.0f);
 		double mid = nextPhase - 15.0 - p.tdcShiftDeg;
-		double mult = 1.0 - p.ripple * std::cos(2 * M_PI * mid / 180.0);
+		double mult = 1.0 - p.ripple * std::cos(2 * kPi * mid / 180.0);
 		if (p.impulseMode != 0) {
 			mult *= strokeGain(p, cumDeg / 180);
 		}

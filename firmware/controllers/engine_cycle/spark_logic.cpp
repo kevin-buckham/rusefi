@@ -406,6 +406,10 @@ static efitick_t scheduleEdgeDwellCharge(IgnitionEvent *event, efitick_t edgeTim
 	}
 	float delayUs = edgedwell::dwellStartDelayUs(remainingDeg, dwellMs, predictedUs,
 		slow, window.lastUsPerDeg(), engine->rpmCalculator.oneDegreeUs);
+	if (delayUs < 0) {
+		// unreachable: the plan is only accepted after chargeInputsUsable(); never turn a refusal into "charge now"
+		delayUs = 0;
+	}
 
 	// the planned dwell is the one actually being used: keeps 'Ignition: Dwell deviation' honest
 	event->sparkDwell = dwellMs;
@@ -719,6 +723,13 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 						[](size_t index) { return getTriggerCentral()->getToothEnginePhase(index); },
 						getTriggerCentral()->engineCycleEventCount, cycle, sparkAngle,
 						edgedwell::forwardDistance(dwellAngle, sparkAngle, cycle));
+					// NaN/unusable speed or dwell inputs would turn into "charge now" (early backup spark): stay on the legacy path
+					const TriggerCentral* tc = getTriggerCentral();
+					if (plan.valid && !edgedwell::chargeInputsUsable(
+							edgedwell::forwardDistance(currentPhase, plan.sparkPhase, cycle), dwellMs,
+							tc->toothWindow.slowUsPerDeg(360), tc->toothWindow.lastUsPerDeg(), engine->rpmCalculator.oneDegreeUs)) {
+						plan.valid = false;
+					}
 					if (plan.valid) {
 						dwellAngle = plan.dwellPhase;
 						sparkAngle = plan.sparkPhase;
