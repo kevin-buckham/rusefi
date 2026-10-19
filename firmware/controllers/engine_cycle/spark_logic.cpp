@@ -13,6 +13,7 @@
 #include "event_queue.h"
 
 #include "knock_logic.h"
+#include "edge_dwell.h"
 
 #if EFI_ENGINE_CONTROL
 
@@ -428,6 +429,19 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 		 * This way we make sure that coil dwell started while spark was enabled would fire and not burn
 		 * the coil.
 		 */
+		if (engineConfiguration->dwellFixOnRpmUpdate && currentPhase != nextPhase && !std::isnan(engine->rpmCalculator.oneDegreeUs)) {
+			/**
+			 * E4: dwellAngle was latched at the previous fire from the RPM of THAT moment, but scheduleByAngle()
+			 * converts it with the CURRENT oneDegreeUs: when RPM was updated in between, the dwell in time scales
+			 * by oldRpm/newRpm (logged 'Ignition: Dwell deviation' -58% at the 230->547 update).
+			 * Keep the tooth selection (dwellAngle) but re-derive the delay so that the dwell is dwellMs at the
+			 * current speed: start (dwellMs worth of degrees) before the spark, never before this tooth.
+			 */
+			float sparkAhead = angleOffset + edgedwell::forwardDistance(dwellAngle, sparkAngle, engine->engineState.engineCycle);
+			float dwellDegNow = dwellMs * 1000.0f / engine->rpmCalculator.oneDegreeUs;
+			angleOffset = std::max(0.0f, sparkAhead - dwellDegNow);
+			event->sparkDwell = dwellMs;
+		}
 		chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset, action_s::make<turnSparkPinHighStartCharging>( event ));
 
 #if EFI_UNIT_TEST

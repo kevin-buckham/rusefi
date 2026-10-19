@@ -72,3 +72,43 @@ TEST(edgeDwell, flagOffNeverFeedsTheWindowAndDoesNotRaiseTheLiveBits) {
 	EXPECT_FALSE(anyBit);
 	EXPECT_EQ(0, slow);
 }
+
+TEST(edgeDwell, dwellStaysNearTheConfiguredTimeWhenRpmIsUpdatedBetweenPlanAndSchedule) {
+	// a crank that speeds up 1 percent per tooth (about 4 percent per stroke); E4 (dwellFixOnRpmUpdate) alone, no latch bit set: the
+	// stored rpm, updated once per 720 deg, always lags, and the dwell angle latched at the previous fire is too short
+	double worst[2];
+	for (int on = 0; on < 2; on++) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		configureCrank(eth);
+		engineConfiguration->dwellFixOnRpmUpdate = on == 1;	// E4 alone: the other two bits stay off
+		setArrayValues(config->sparkDwellValues, 4.0f); // running dwell 4 ms flat; cranking dwell stays 4.5 ms
+		Profile p = steady(1000, 80);
+		double r = 1000;
+		for (int i = 0; i < 100; i++) {
+			r *= 1.01;
+			p.rpm.push_back(r);
+		}
+		for (int i = 0; i < 60; i++) {
+			p.rpm.push_back(r);
+		}
+		p.ripple = 0.05f;
+		int latched = 0;
+		p.afterTooth = [&](size_t) {
+			latched += engine->ignitionState.edgeDwellUnstable;
+		};
+		Trace t;
+		drive(eth, t, p);
+		ASSERT_EQ(RUNNING, t.finalState);
+		EXPECT_EQ(0, latched) << "this test measures the E4 bit alone: the instability latch is a different bit and stays off";
+		double w = 9;
+		for (const Spark& s : analyze(t)) {
+			if (s.tUs > NT2US((double)t.teeth[90].nt) && s.dwellMs > 0) {
+				w = std::min(w, s.dwellMs / 4.0);
+			}
+		}
+		worst[on] = w;
+	}
+	printf("E4 worst actual/4ms dwell while the crank speeds up 1%% per tooth: flag off %.2f, on %.2f\n", worst[0], worst[1]);
+	EXPECT_LT(worst[0], 0.65);
+	EXPECT_GT(worst[1], worst[0] + 0.15);
+}
