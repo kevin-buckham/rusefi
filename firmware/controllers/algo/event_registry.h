@@ -80,6 +80,15 @@ public:
 	float dwellAngle = 0;
 
 	/**
+	 * crankingEdgeDwell: per-event, per-cycle decision between the legacy and the tooth-locked path. The angles are latched once
+	 * per cycle but the mode can change between the legacy dwell tooth and the edge dwell tooth, so the first tooth that
+	 * touches the event decides. Reset whenever the angles are re-latched (prepareCylinderIgnitionSchedule).
+	 * 0 = undecided, 1 = scheduled by the legacy path (edge mode must leave it alone), 2 = edge dwell tooth still ahead
+	 * (edge mode is honoured even if the mode gate has dropped meanwhile).
+	 */
+	uint8_t edgeDwellCycleState = 0;
+
+	/**
 	 * Sequential number of currently processed spark event
 	 * @see engineState.globalSparkCounter
 	 */

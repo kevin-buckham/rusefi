@@ -91,6 +91,7 @@ static void prepareCylinderIgnitionSchedule(angle_t dwellAngleDuration, floatms_
 
 	// let's save planned duration so that we can later compare it with reality
 	event->sparkDwell = sparkDwell;
+	event->edgeDwellCycleState = 0;
 
 	auto ignitionMode = getCurrentIgnitionMode();
 
@@ -484,7 +485,8 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 		}
 
 #if EFI_UNIT_TEST
-		engine->onScheduleTurnSparkPinHighStartCharging(*event, edgeTimestamp, angleOffset, chargeTime);
+		// edge events: the charge is scheduled by time from this tooth, the offset in degrees is not used
+		engine->onScheduleTurnSparkPinHighStartCharging(*event, edgeTimestamp, edgeEvent ? 0.0f : angleOffset, chargeTime);
 #endif
 
 #if SPARK_EXTREME_LOGGING
@@ -700,7 +702,12 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 			}
 
 			bool edgeEvent = false;
-			if (edgeModeAllowed) {
+			const angle_t legacyDwellAngle = dwellAngle;
+			// the decision is per event per cycle (see IgnitionEvent::edgeDwellCycleState): an event already scheduled by the
+			// legacy path is never rescheduled by the edge path (double charge), and an event whose edge dwell tooth is
+			// still ahead is completed on the edge path even if the mode gate dropped in between (skipped spark)
+			const bool edgePending = event->edgeDwellCycleState == 2;
+			if ((edgeModeAllowed || edgePending) && event->edgeDwellCycleState != 1) {
 				const float cycle = engineCycleDeg;
 				const float tdcPhase = getPerCylinderFiringOrderOffset(event->cylinderIndex, event->coilIndex);
 				// a command below kEdgeMinAdvanceDeg BTDC keeps the legacy path for this event (never snapped to 18 ATDC)
@@ -715,7 +722,6 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 						dwellAngle = plan.dwellPhase;
 						sparkAngle = plan.sparkPhase;
 						edgeEvent = true;
-						engine->ignitionState.edgeDwellActive = true;
 					}
 				}
 			}
@@ -742,7 +748,14 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 			}
 
 			if (!isOddCylWastedEvent && !isPhaseInRange(dwellAngle, currentPhase, nextPhase)) {
+				if (edgeEvent && isPhaseInRange(legacyDwellAngle, currentPhase, nextPhase)) {
+					// the legacy dwell tooth: the charge belongs to the later edge dwell tooth
+					event->edgeDwellCycleState = 2;
+				}
 				continue;
+			}
+			if (edgePending) {
+				event->edgeDwellCycleState = 0;
 			}
 
 			if (i == 0 && engineConfiguration->artificialTestMisfire && (getRevolutionCounter() % ((int)engineConfiguration->scriptSetting[5]) == 0)) {
@@ -784,6 +797,12 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 */
 #endif // EFI_ANTILAG_SYSTEM
 
+			if (edgeEvent) {
+				// means "scheduled on the edge path" for this tooth (a skipped/limited event does not raise it)
+				engine->ignitionState.edgeDwellActive = true;
+			} else {
+				event->edgeDwellCycleState = 1;
+			}
 			scheduleSparkEvent(limitedSpark, event, rpm, dwellMs, dwellAngle, sparkAngle, edgeTimestamp, currentPhase, nextPhase, edgeEvent);
 		}
 	}

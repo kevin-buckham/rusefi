@@ -270,7 +270,7 @@ TEST(edgeDwell, edgeModeStaysInactiveWhileSpinningUpEvenThoughIsCrankingIsTrueTh
 	printf("spinning-up teeth with isCranking() true: %d\n", forcedTeeth);
 	EXPECT_GE(forcedTeeth, 1) << "the scenario must reach SPINNING_UP with a non-zero rpm for this test to mean anything";
 	EXPECT_EQ(0, activeWhileForced);
-	EXPECT_GT(activeWhileCranking, 10);
+	EXPECT_GE(activeWhileCranking, 8);	// edgeDwellActive = an event was scheduled on the edge path at this tooth (4 per 24 teeth)
 }
 
 TEST(edgeDwell, flagOffDeliversWhatTodayDeliversForEveryCommand) {
@@ -379,6 +379,7 @@ TEST(edgeDwell, switchingTheBitOnMidCrankNeverDoublesStrandsOrAdvancesASpark) {
 		int validBefore = 0;
 		bool edgeBeforeSwitch = false;
 		int invalidActive = 0;
+		Profile ref = p;	// the SAME profile with the bit never on
 		p.beforeTooth = [&](size_t i) {
 			if ((int)i == n) {
 				engineConfiguration->crankingEdgeDwell = true;
@@ -394,18 +395,55 @@ TEST(edgeDwell, switchingTheBitOnMidCrankNeverDoublesStrandsOrAdvancesASpark) {
 			}
 		};
 		Trace t = runTrace(p, false);
-		Trace off = runTrace(steady(210, 120), false);
+		Trace off = runTrace(ref, false);
 		printf("bit switched on at tooth %d: teeth with edge active but window not yet valid: %d\n", n, invalidActive);
 		EXPECT_EQ(0, validBefore) << n;
 		EXPECT_FALSE(edgeBeforeSwitch) << n;
 		Integrity i = integrity(t);
 		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling + i.noCharge) << "switched at tooth " << n;
 		EXPECT_EQ(0, t.sparkOutOfOrder) << n;
-		Integrity io = integrity(off);
-		EXPECT_GE(i.sparks, io.sparks - 1) << "a spark was skipped, switched at tooth " << n;
-		for (const Spark& s : analyze(t)) {
-			if (s.tUs > NT2US((double)t.teeth[n].nt)) {
-				EXPECT_GE(s.errDeg, -0.06 - 8.0) << "switched at tooth " << n;	// 14 BTDC command: nothing beyond today's own legacy range
+		auto a = analyze(t);
+		auto b = analyze(off);
+		ASSERT_EQ(b.size(), a.size()) << "a spark was skipped or added, switched at tooth " << n;
+		for (size_t k = 0; k < a.size(); k++) {
+			// an edge-path spark is never earlier than commanded; a legacy one is exactly today's
+			EXPECT_TRUE(a[k].errDeg >= -0.06 || std::fabs(a[k].errDeg - b[k].errDeg) < 0.5)
+				<< "switched at tooth " << n << " spark " << k << " err " << a[k].errDeg << " legacy " << b[k].errDeg;
+		}
+	}
+}
+
+TEST(edgeDwell, theModeDroppingOrRisingBetweenTheLegacyAndTheEdgeDwellToothNeverSkipsOrDoubleChargesASpark) {
+	// the angles are latched once per cycle but the mode gate is re-evaluated per tooth: toggle the bit at every tooth
+	// of a stretch, both directions, with large commands (the dwell tooth of the edge plan is then later than the legacy one)
+	for (double commanded : {14.0, 20.0, 29.0, 38.0}) {
+		for (int direction = 0; direction < 2; direction++) {
+			for (int n = 60; n < 84; n++) {
+				Profile p = steady(210, 170);
+				p.noise = 0.03f;
+				p.seed = 6;
+				p.beforeTooth = [=](size_t i) {
+					if ((int)i == n) {
+						engineConfiguration->crankingEdgeDwell = direction == 0 ? false : true;
+					}
+				};
+				Profile refP = p;
+				refP.beforeTooth = nullptr;
+				Trace t = runTrace(p, direction == 0, [=]() { engineConfiguration->fixedTiming = commanded; });
+				Trace ref = runTrace(refP, false, [=]() { engineConfiguration->fixedTiming = commanded; });
+				Integrity i = integrity(t);
+				const std::string what = "commanded " + std::to_string(commanded) + " direction " + std::to_string(direction) + " tooth " + std::to_string(n);
+				EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << what;
+				EXPECT_EQ(0, i.noCharge) << what;
+				EXPECT_EQ(0, t.sparkOutOfOrder) << what;
+				auto a = analyze(t);
+				auto b = analyze(ref);
+				ASSERT_EQ(b.size(), a.size()) << "a spark was skipped or added, " << what;
+				for (size_t k = 0; k < a.size(); k++) {
+					// an edge-path spark is never earlier than commanded; a legacy-path one is what today delivers
+					EXPECT_TRUE(a[k].errDeg >= -0.06 || std::fabs(a[k].errDeg - b[k].errDeg) < 0.5)
+						<< what << " spark " << k << " err " << a[k].errDeg << " legacy " << b[k].errDeg;
+				}
 			}
 		}
 	}
