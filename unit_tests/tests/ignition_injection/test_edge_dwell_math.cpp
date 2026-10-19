@@ -117,20 +117,6 @@ TEST(edgeDwellMath, theSanityCapStopsAnAbsurdPredictionAtTwiceTheSlowestTooth) {
 	EXPECT_NEAR(55500, dwellStartDelayUs(30, 4.5f, 150000, 1000, 0, 800), 1);
 }
 
-TEST(edgeDwellMath, theChargeNeverStartsMoreThanTwoDwellsBeforeTheEstimatedSpark) {
-	// DA#4 lower bound, swept: for every estimate, dwell and speed the delay leaves at most kMaxDwellFactor x dwell
-	for (float dwellMs : {2.5f, 3.3f, 4.5f, 6.0f}) {
-		for (float predicted = 2000; predicted < 120000; predicted += 733) {
-			for (float slow : {0.0f, 400.0f, 1000.0f, 2500.0f}) {
-				float delay = dwellStartDelayUs(30, dwellMs, predicted, slow, 800, 800);
-				float cap = slow > 0 ? std::min(predicted, kTier1CapFactor * 30 * slow) : predicted;
-				EXPECT_LE(cap - delay, kMaxDwellFactor * dwellMs * 1000.0f + 1) << predicted << " " << dwellMs << " " << slow;
-				EXPECT_GE(delay, 0.0f);
-			}
-		}
-	}
-}
-
 TEST(edgeDwellMath, dwellDelayFromTheSlowMaximumIsGuardedByTheNewestInterval) {
 	// no prediction: slow 1133 us/deg would delay 27.99 ms, but the newest interval ran at 700 us/deg
 	// so at least 3 ms (half the dwell) must remain at that speed: delay <= 30*700 - 3000

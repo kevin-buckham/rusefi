@@ -18,6 +18,41 @@ Trace run(const Profile& p, bool edgeDwell) {
 	return runTrace(p, edgeDwell);
 }
 
+// Worst (most advanced) delivered spark, in degrees BTDC, over every point at which the crank can slow by factor k right
+// after a tooth, steady R rpm before. commandedBtdc is the advance the cranking table would command at R (fixed timing
+// in the harness). Only sparks after the slowdown are looked at. capFires counts sparks whose dwell reached the backup.
+double worstDeliveredBtdc(double rpm, double k, bool edge, double commandedBtdc, int* capFires = nullptr) {
+	double worst = 99;
+	int caps = 0;
+	for (int drop = 61; drop < 61 + 24; drop++) {
+		Profile p = steady(rpm, drop);
+		p.ripple = 0;
+		for (int i = 0; i < 16; i++) {
+			p.rpm.push_back(rpm / k);
+		}
+		Trace t = runTrace(p, edge, [&]() { engineConfiguration->fixedTiming = commandedBtdc; });
+		double tSlow = NT2US((double)t.teeth[drop - 1].nt);
+		for (const Spark& s : analyze(t)) {
+			if (s.tUs > tSlow - 1000 && s.tUs < tSlow + 2000000) {
+				worst = std::min(worst, s.errDeg);
+				if (s.dwellMs > kBackupMs - 0.1) {
+					caps++;
+				}
+			}
+		}
+	}
+	if (capFires) {
+		*capFires = caps;
+	}
+	return commandedBtdc - worst;
+}
+
+struct SweepRow {
+	const char* name;
+	int impulseMode;
+	float impulse;
+};
+
 } // namespace
 
 TEST(edgeDwell, allThreeBitsDefaultToOff) {
@@ -446,5 +481,179 @@ TEST(edgeDwell, theModeDroppingOrRisingBetweenTheLegacyAndTheEdgeDwellToothNever
 				}
 			}
 		}
+	}
+}
+
+TEST(edgeDwell, overDwellBackupIsNeverWorseThanTodaysDeliveredAngleAt120And150And210Rpm) {
+	// rpm and what crankingAdvance 0/14/16/16 at 0/200/400/1000 rpm commands there. At 120 and 150 rpm the command is
+	// below 12 BTDC, so the event keeps the legacy path: edge == today. At 210 rpm (14.1) the 12 BTDC tooth and the
+	// 3 x dwell backup apply.
+	struct Row { double rpm; double cmd; double edge[4]; double today[4]; };
+	// measured worst delivered BTDC for k = 1.5 / 2 / 3 / 4 (asserted +-0.3 deg)
+	const Row rows[] = {
+		{120, 8.4, {9.6, 10.2, 10.8, 12.0}, {9.6, 10.2, 10.8, 12.0}},
+		{150, 10.5, {19.7, 25.2, 30.8, 42.0}, {19.7, 25.2, 30.8, 42.0}},
+		{210, 14.1, {14.4, 21.3, 28.2, 42.0}, {23.4, 28.0, 32.7, 42.0}},
+	};
+	for (const Row& r : rows) {
+		int ki = 0;
+		for (double k : {1.5, 2.0, 3.0, 4.0}) {
+			int idx = ki++;
+			int caps = 0;
+			double edge = worstDeliveredBtdc(r.rpm, k, true, r.cmd, &caps);
+			double today = worstDeliveredBtdc(r.rpm, k, false, r.cmd);
+			bool legacy = r.cmd < 12;
+			printf("overdwell R=%.0f cmd=%.1f k=%.1f: edge worst %.1f BTDC (%d cap fires), today %.1f BTDC%s\n", r.rpm, r.cmd, k, edge, caps, today, legacy ? " (legacy path)" : "");
+			EXPECT_NEAR(r.edge[idx], edge, 0.3) << r.rpm << " " << k;
+			EXPECT_NEAR(r.today[idx], today, 0.3) << r.rpm << " " << k;
+			EXPECT_LE(edge, today + 0.05) << "edge mode worse than today's delivered angle at " << r.rpm << " rpm k=" << k;
+			if (legacy) {
+				EXPECT_NEAR(edge, today, 0.01) << r.rpm << " " << k << ": below 12 BTDC the path must be today's";
+			}
+		}
+	}
+}
+
+TEST(edgeDwell, flashAndDieBackNeverAdvanceTheSparkAndLoseAtMostAFewSparks) {
+	for (float shift : {0.0f, 60.0f, 120.0f}) {
+		Profile p = dieBack();
+		p.noise = 0.03f;
+		p.seed = 4242;
+		p.tdcShiftDeg = shift;
+		Trace t = run(p, true);
+		EXPECT_EQ(CRANKING, t.finalState) << "stored rpm must stay below cranking.rpm for this scenario to mean anything";
+		auto sparks = sparksAfter(t, 60);
+		ASSERT_GE(sparks.size(), 8u);
+		int lost = 0;
+		for (const Spark& s : sparks) {
+			if (s.dwellMs < 0) {
+				lost++;
+				continue;
+			}
+			EXPECT_GE(s.errDeg, kLockedErrDeg - 0.05) << "shift " << shift << " spark more advanced than the tooth lock";
+			EXPECT_LE(s.dwellMs, kBackupMs - kBackupMarginMs) << "shift " << shift;
+		}
+		printf("die-back seed 4242 shift %.0f: %zu sparks, lost %d, spark out of order %d\n", shift, sparks.size(), lost, (int)t.sparkOutOfOrder);
+		// owner decision 2026-10-17: a small fraction of lost sparks (misfire = safe direction) is accepted
+		EXPECT_LE(lost, 2) << "shift " << shift;
+		EXPECT_LE((int)t.sparkOutOfOrder, 2) << "shift " << shift;
+		Integrity i = integrity(t);
+		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << "shift " << shift;
+	}
+}
+
+// THE sweep, parameterised by the compression ripple amplitude. Run at +-30 percent (the old guess) and +-50 percent.
+// When the composite-logger capture of a flag-off start gives the real ripple, add a row with that value.
+// Lost sparks: the charge is refused because it would start after the spark (misfire, the safe direction).
+static void checkSweepsAtRipple(double ripple) {
+	const SweepRow rows[] = {{"no impulse", 0, 0}, {"alternating +-10%", 1, 0.10f}, {"random +-10%", 2, 0.10f}};
+	for (const SweepRow& row : rows) {
+		SweepStats all;
+		struct Sc { const char* name; Profile p; double lostLimitPercent; int consecLimit; };
+		const Sc scenarios[] = {{"steady 210", steady(210, 140), 2.0, 2}, {"flash 210->800", flash(), 3.0, 1}, {"flash + die-back", dieBack(), 12.0, 3}};
+		for (const Sc& sc : scenarios) {
+			SweepStats st = sweep(sc.p, ripple, row.impulseMode, row.impulse);
+			SweepStats today = sweep(sc.p, ripple, row.impulseMode, row.impulse, false);
+			printf("sweep ripple +-%.0f%% %-18s %-17s: %4d sparks, lost %3d (%.1f%%, max %d in a row), early %d, max dwell %.1f ms (backup %.1f), past margin %d | today: lost %d, delivered %.1f..%.1f deg vs command, %d earlier than commanded\n",
+				ripple * 100, row.name, sc.name, st.sparks, st.uncharged, st.lostPercent(), st.maxConsecutiveLost, st.early, st.maxDwellMs, kBackupMs, st.pastMargin,
+				today.uncharged, today.minErrDeg, today.maxErrDeg, today.early);
+			EXPECT_EQ(0, st.early) << sc.name << " " << row.name << " ripple " << ripple;
+			EXPECT_EQ(0, st.pastMargin) << sc.name << " " << row.name << " ripple " << ripple;
+			EXPECT_LE(st.maxDwellMs, kBackupMs - kBackupMarginMs) << sc.name << " " << row.name << " ripple " << ripple;
+			EXPECT_LE(st.lostPercent(), sc.lostLimitPercent) << sc.name << " " << row.name << " ripple " << ripple;
+			EXPECT_LE(st.maxConsecutiveLost, sc.consecLimit) << sc.name << " " << row.name << " ripple " << ripple;
+			all.add(st);
+		}
+		printf("sweep ripple +-%.0f%% %-18s TOTAL: %d sparks, lost %d (%.2f%%), max %d in a row, max dwell %.1f ms\n",
+			ripple * 100, row.name, all.sparks, all.uncharged, all.lostPercent(), all.maxConsecutiveLost, all.maxDwellMs);
+		EXPECT_LE(all.lostPercent(), 5.0);
+	}
+}
+
+TEST(edgeDwell, sweepAtThirtyPercentRipple) {
+	checkSweepsAtRipple(0.30);
+}
+
+TEST(edgeDwell, sweepAtFiftyPercentRipple) {
+	checkSweepsAtRipple(0.50);
+}
+
+TEST(edgeDwell, dieBackTodayVersusEdgeDeliveredErrorAndLostSparks) {
+	SweepStats today = sweep(dieBack(), 0.30, 0, 0, false);
+	SweepStats edge = sweep(dieBack(), 0.30, 0, 0, true);
+	printf("die-back today: %d sparks, lost %d, delivered minus commanded %.1f..%.1f deg, %d earlier than commanded\n",
+		today.sparks, today.uncharged, today.minErrDeg, today.maxErrDeg, today.early);
+	printf("die-back edge : %d sparks, lost %d (%.1f%%, max %d in a row), delivered minus commanded %.1f..%.1f deg, %d earlier than the tooth lock\n",
+		edge.sparks, edge.uncharged, edge.lostPercent(), edge.maxConsecutiveLost, edge.minErrDeg, edge.maxErrDeg, edge.early);
+	EXPECT_EQ(0, today.uncharged);
+	EXPECT_NEAR(kLockedErrDeg, edge.minErrDeg, 0.05);
+	EXPECT_NEAR(kLockedErrDeg, edge.maxErrDeg, 0.05);
+	EXPECT_EQ(0, edge.early);
+	EXPECT_LT(today.minErrDeg, -10.0);
+	EXPECT_GT(today.maxErrDeg, 80.0);
+	EXPECT_GT(today.early, 300);
+	EXPECT_LE(edge.maxConsecutiveLost, 2);
+	EXPECT_LE(edge.lostPercent(), 12.0);
+}
+
+TEST(edgeDwell, alternatingFireNoFireImpulseSweepFindsTheBreakingThreshold) {
+	// one stroke fires and the next does not, amplitude 10..50 percent of speed in 2.5 percent steps, three scenarios,
+	// ripple +-30 and +-50 percent. 180-deg stroke-twin predictor only.
+	for (double ripple : {0.30, 0.50}) {
+		double firstEarly = 0, firstEarlyDeliveredBtdc = 0, firstAdvancedBtdc = 0, firstAdvancedAt = 0, firstPastMargin = 0;
+		for (int i = 4; i <= 20; i++) {
+			float impulse = 0.025f * i;
+			SweepStats all;
+			for (const Profile& sc : {steady(210, 140), flash(), dieBack()}) {
+				all.add(sweep(sc, ripple, 1, impulse));
+			}
+			double deliveredBtdc = 14.0 - all.minErrDeg;
+			printf("impulse alternating +-%.1f%% (ripple +-%.0f%%): %d sparks, lost %d (%.1f%%, max %d in a row), early %d, most advanced delivered %.1f BTDC (commanded 14), max dwell %.1f ms\n",
+				impulse * 100, ripple * 100, all.sparks, all.uncharged, all.lostPercent(), all.maxConsecutiveLost, all.early, deliveredBtdc, all.maxDwellMs);
+			if (all.early > 0 && firstEarly == 0) {
+				firstEarly = impulse;
+				firstEarlyDeliveredBtdc = deliveredBtdc;
+			}
+			if (all.maxDwellMs > kBackupMs - kBackupMarginMs && firstPastMargin == 0) {
+				firstPastMargin = impulse;
+			}
+			if (deliveredBtdc > 14.0 + 0.05 && firstAdvancedBtdc == 0) {
+				firstAdvancedBtdc = deliveredBtdc;
+				firstAdvancedAt = impulse;
+			}
+			// measured: +-30 percent ripple holds the tooth lock up to 25 percent and the dwell margin up to 22.5 percent;
+			// +-50 percent ripple breaks earlier (first early spark at 22.5 percent), so the asserted range is 20 percent there
+			float lockLimit = ripple < 0.4 ? 0.25f : 0.20f;
+			float marginLimit = ripple < 0.4 ? 0.225f : 0.20f;
+			if (impulse <= lockLimit + 1e-6f) {
+				EXPECT_EQ(0, all.early) << impulse << " ripple " << ripple;
+				EXPECT_LE(all.maxConsecutiveLost, 3) << impulse << " ripple " << ripple;
+				EXPECT_LE(all.lostPercent(), 12.0) << impulse << " ripple " << ripple;
+			}
+			if (impulse <= marginLimit + 1e-6f) {
+				EXPECT_LE(all.maxDwellMs, kBackupMs - kBackupMarginMs) << impulse << " ripple " << ripple;
+			}
+		}
+		printf("BREAKING THRESHOLD (alternating impulse, ripple +-%.0f%%, 180-deg twin only): first early spark at %.1f%% delivered %.1f BTDC (tooth lock 12, commanded 14); first spark more advanced than commanded at %.1f%% (%.1f BTDC); first dwell past the %.1f ms margin limit at %.1f%%\n",
+			ripple * 100, firstEarly * 100, firstEarlyDeliveredBtdc, firstAdvancedAt * 100, firstAdvancedBtdc, kBackupMs - kBackupMarginMs, firstPastMargin * 100);
+		EXPECT_NEAR(ripple < 0.4 ? 0.275 : 0.225, firstEarly, 1e-6) << ripple;
+		EXPECT_NEAR(ripple < 0.4 ? 13.2 : 14.6, firstEarlyDeliveredBtdc, 0.3) << ripple;
+		EXPECT_NEAR(ripple < 0.4 ? 0.30 : 0.225, firstAdvancedAt, 1e-6) << ripple;
+		EXPECT_NEAR(ripple < 0.4 ? 0.25 : 0.225, firstPastMargin, 1e-6) << ripple;
+	}
+}
+
+TEST(edgeDwell, randomPerStrokeImpulsesUpToThirtyPercentNeverFireEarly) {
+	for (float impulse : {0.05f, 0.10f, 0.15f, 0.20f, 0.30f}) {
+		SweepStats all;
+		for (const Profile& sc : {steady(210, 140), flash(), dieBack()}) {
+			all.add(sweep(sc, 0.30, 2, impulse));
+		}
+		printf("impulse random +-%.0f%%: %d sparks, lost %d (%.2f%%, max %d in a row), early %d, max dwell %.1f ms\n",
+			impulse * 100, all.sparks, all.uncharged, all.lostPercent(), all.maxConsecutiveLost, all.early, all.maxDwellMs);
+		EXPECT_EQ(0, all.early) << impulse;
+		EXPECT_LE(all.maxDwellMs, kBackupMs - kBackupMarginMs) << impulse;
+		EXPECT_LE(all.maxConsecutiveLost, 1) << impulse;
+		EXPECT_LE(all.lostPercent(), 6.0) << impulse;
 	}
 }

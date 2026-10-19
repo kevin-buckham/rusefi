@@ -24,11 +24,6 @@ constexpr float kToothEpsDeg = 0.05f;
 constexpr float kLegacyOverdwellFactor = 1.5f;
 constexpr float kEdgeOverdwellFactor = 3.0f;
 
-// the charge may never start earlier than (predicted spark time - this many dwells): the coil sees at most this
-// multiple of the configured dwell when the prediction is right, leaving kEdgeOverdwellFactor - this as margin
-// before the backup (DA#4: max dwell must stay >= 2 ms below the backup in every sweep)
-constexpr float kMaxDwellFactor = 2.0f;
-
 // Edge mode is used for an ignition event only when its COMMANDED advance is at least this many degrees BTDC. Below it
 // the tooth at or after the command would be the 18 ATDC tooth (up to 29 deg of retard), so the event keeps the legacy
 // time-scheduled path (owner decision 2026-10-17, replaces the earlier 12 BTDC floor). With crankingAdvance 0/14/16/16
@@ -160,7 +155,7 @@ Plan planForEvent(PhaseAt phaseAt, size_t count, float cycleDeg, float commanded
  * Delay from the dwell tooth to the start of coil charge. Three tiers, best first:
  *  1. predictedUs > 0: the 180-deg stroke-twin prediction (ToothPeriodWindow::predictTimeUs with the 180-deg twin, scaled by
  *     the newest interval's change and extrapolated for a decelerating crank), sanity-capped at 2 x the slowest
- *     tooth of the last 360 deg, and never started earlier than predicted spark time - kMaxDwellFactor x dwell;
+ *     tooth of the last 360 deg;
  *  2. slowUsPerDeg > 0: the slow-biased 360-deg maximum, guarded by the newest interval so the charge cannot start
  *     so late that less than kMinDwellFraction of the dwell remains at the newest speed;
  *  3. otherwise the stored 720-deg RPM (today's behaviour), same guard.
@@ -185,15 +180,10 @@ inline float dwellStartDelayUs(float remainingDeg, float dwellMs, float predicte
 		if (slowUsPerDeg > 0 && t > kTier1CapFactor * remainingDeg * slowUsPerDeg) {
 			t = kTier1CapFactor * remainingDeg * slowUsPerDeg;
 		}
+		// The dwell is t - delay = dwellUs at the estimate by construction (so at most 1 x configured when the estimate is
+		// right; the REAL dwell is bounded by the sweeps). A separate 2 x dwell lower bound on the delay was removed: it is
+		// arithmetically unreachable (t - dwellUs >= t - 2 x dwellUs for any dwellUs >= 0).
 		float d = t - dwellUs;
-		// lower bound (DA#4): the charge never starts earlier than the estimated spark time minus kMaxDwellFactor dwells,
-		// i.e. the dwell is at most kMaxDwellFactor x configured whenever the estimate is right. With dwell = 1 x at the
-		// estimate this holds by construction; it is kept as an explicit clamp so that a later bias or offset cannot
-		// break it silently (unit-tested). The REAL dwell is bounded by the sweeps, not by this line.
-		float lb = t - kMaxDwellFactor * dwellUs;
-		if (d < lb) {
-			d = lb;
-		}
 		return d > 0 ? d : 0;
 	}
 	float usPerDeg = slowUsPerDeg > 0 ? slowUsPerDeg : storedUsPerDeg;
