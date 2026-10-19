@@ -385,8 +385,38 @@ void turnSparkPinHighStartCharging(IgnitionEvent *event) {
 }
 
 
+/**
+ * crankingEdgeDwell, tooth-locked branch: the dwell tooth and the spark tooth are exact tooth phases
+ * (see edgedwell::planForEvent), so the charge start is the only thing that needs a time estimate. It comes from
+ * the recent tooth intervals (ToothPeriodWindow, see edgedwell::dwellStartDelayUs for the three tiers) and falls
+ * back to the stored RPM until a full 360 deg has been observed.
+ */
+static efitick_t scheduleEdgeDwellCharge(IgnitionEvent *event, efitick_t edgeTimestamp,
+		float sparkPhase, float currentPhase, floatms_t dwellMs) {
+	const ToothPeriodWindow &window = getTriggerCentral()->toothWindow;
+	const float cycle = engine->engineState.engineCycle;
+
+	float remainingDeg = edgedwell::forwardDistance(currentPhase, sparkPhase, cycle);
+	float slow = window.slowUsPerDeg(360);
+	// the 180-deg stroke-twin prediction is only trusted once the locked 360-deg window is full
+	float predictedUs = 0;
+	if (slow > 0 && engineConfiguration->cylindersCount > 0) {
+		predictedUs = window.predictTimeUs(currentPhase, sparkPhase, cycle / engineConfiguration->cylindersCount, cycle, edgedwell::kToothEpsDeg);
+	}
+	float delayUs = edgedwell::dwellStartDelayUs(remainingDeg, dwellMs, predictedUs,
+		slow, window.lastUsPerDeg(), engine->rpmCalculator.oneDegreeUs);
+
+	// the planned dwell is the one actually being used: keeps 'Ignition: Dwell deviation' honest
+	event->sparkDwell = dwellMs;
+
+	efitick_t chargeTime = sumTickAndFloat(edgeTimestamp, USF2NT(delayUs));
+	engine->scheduler.schedule("dwell", &event->dwellStartTimer, chargeTime, action_s::make<turnSparkPinHighStartCharging>( event ));
+	return chargeTime;
+}
+
 static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
-		float rpm, float dwellMs, float dwellAngle, float sparkAngle, efitick_t edgeTimestamp, float currentPhase, float nextPhase) {
+		float rpm, float dwellMs, float dwellAngle, float sparkAngle, efitick_t edgeTimestamp, float currentPhase, float nextPhase,
+		bool edgeEvent) {
 	UNUSED(rpm);
 
 	float angleOffset = dwellAngle - currentPhase;
@@ -411,6 +441,10 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 	 */
 	event->sparkCounter = engine->engineState.globalSparkCounter++;
 	event->wasSparkLimited = limitedSpark;
+	if (engineConfiguration->crankingEdgeDwell || engineConfiguration->edgeDwellPostStartLatch) {
+		// per-spark log bit: this spark was scheduled by the edge-locked path (0 = legacy path, even with edge mode on)
+		engine->ignitionState.edgeDwellSparkEdge = edgeEvent;
+	}
 
 	efitick_t chargeTime = 0;
 
@@ -429,7 +463,10 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 		 * This way we make sure that coil dwell started while spark was enabled would fire and not burn
 		 * the coil.
 		 */
-		if (engineConfiguration->dwellFixOnRpmUpdate && currentPhase != nextPhase && !std::isnan(engine->rpmCalculator.oneDegreeUs)) {
+		if (edgeEvent) {
+			// angleOffset is 0 here: dwellAngle IS the current tooth
+			chargeTime = scheduleEdgeDwellCharge(event, edgeTimestamp, sparkAngle, currentPhase, dwellMs);
+		} else if (engineConfiguration->dwellFixOnRpmUpdate && currentPhase != nextPhase && !std::isnan(engine->rpmCalculator.oneDegreeUs)) {
 			/**
 			 * E4: dwellAngle was latched at the previous fire from the RPM of THAT moment, but scheduleByAngle()
 			 * converts it with the CURRENT oneDegreeUs: when RPM was updated in between, the dwell in time scales
@@ -441,8 +478,10 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 			float dwellDegNow = dwellMs * 1000.0f / engine->rpmCalculator.oneDegreeUs;
 			angleOffset = std::max(0.0f, sparkAhead - dwellDegNow);
 			event->sparkDwell = dwellMs;
+			chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset, action_s::make<turnSparkPinHighStartCharging>( event ));
+		} else {
+			chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset, action_s::make<turnSparkPinHighStartCharging>( event ));
 		}
-		chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset, action_s::make<turnSparkPinHighStartCharging>( event ));
 
 #if EFI_UNIT_TEST
 		engine->onScheduleTurnSparkPinHighStartCharging(*event, edgeTimestamp, angleOffset, chargeTime);
@@ -497,8 +536,9 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 	} else {
 		// event was queued in relation to some expected tooth event in the future which might just never come so we shall protect from over-dwell
 		if (!limitedSpark) {
-			// auto fire spark at 1.5x nominal dwell
-			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(1.5f * dwellMs));
+			// auto fire spark at 1.5x nominal dwell (3x in tooth-locked cranking mode: an over-dwell fire there is an EARLY spark)
+			float overdwellFactor = edgeEvent ? edgedwell::kEdgeOverdwellFactor : edgedwell::kLegacyOverdwellFactor;
+			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(overdwellFactor * dwellMs));
 
 #if SPARK_EXTREME_LOGGING
 			efitimeus_t fireTimeUs = NT2US(fireTime);
@@ -613,6 +653,40 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 		engine->engineState.useOddFireWastedSpark
 		&& getCurrentIgnitionMode() == IM_WASTED_SPARK;
 
+	// Cranking edge-dwell (default off, three independent bits):
+	//  crankingEdgeDwell        - tooth-locked spark + fresh-speed charge start, only in the CRANKING state (isCranking() also
+	//                             covers SPINNING_UP: edge mode stays out of it) and per event only when the commanded
+	//                             advance is >= edgedwell::kEdgeMinAdvanceDeg (12 BTDC); other events keep the legacy path;
+	//  edgeDwellPostStartLatch  - the same edge path in RUNNING, only during the first kPostStartWindowEvents cylinder events
+	//                             after the switch to RUNNING and only after the per-cylinder period jumped by 18.75 percent or
+	//                             more below 1400 rpm (E931 style detector, see ToothPeriodWindow::instabilityLatched);
+	//  dwellFixOnRpmUpdate      - E4, legacy path only (see scheduleSparkEvent).
+	// Odd-fire wasted spark and wheels that deliver falling edges are not covered: they keep today's behaviour.
+	// With both of the first two bits off nothing below is evaluated or written (byte-for-byte today's behaviour).
+	const bool edgeBitsSet = engineConfiguration->crankingEdgeDwell || engineConfiguration->edgeDwellPostStartLatch;
+	const float engineCycleDeg = engine->engineState.engineCycle;
+	bool edgeModeAllowed = false;
+	if (edgeBitsSet) {
+		const spinning_state_e rpmState = engine->rpmCalculator.getState();
+		const bool crankingEdgeNow = engineConfiguration->crankingEdgeDwell && rpmState == CRANKING;
+		const float postStartWindowDeg = engineConfiguration->cylindersCount > 0
+			? edgedwell::kPostStartWindowEvents * engineCycleDeg / engineConfiguration->cylindersCount : 0;
+		const bool unstableLatched = engineConfiguration->edgeDwellPostStartLatch && rpmState == RUNNING
+			&& getTriggerCentral()->toothWindow.postStartActive(postStartWindowDeg)
+			&& getTriggerCentral()->toothWindow.instabilityLatched(engineCycleDeg);
+		edgeModeAllowed = (crankingEdgeNow || unstableLatched)
+			&& !enableOddCylinderWastedSpark
+			&& getTriggerCentral()->triggerShape.useOnlyRisingEdges;
+		engine->ignitionState.edgeDwellActive = false;
+		engine->ignitionState.edgeDwellUnstable = unstableLatched;
+		engine->ignitionState.edgeDwellWindowValid = edgeModeAllowed && getTriggerCentral()->toothWindow.slowUsPerDeg(360) > 0;
+	} else if (engine->ignitionState.edgeDwellActive || engine->ignitionState.edgeDwellUnstable || engine->ignitionState.edgeDwellWindowValid) {
+		// a bit was switched off while the live bits were up: lower them (no behavioural effect)
+		engine->ignitionState.edgeDwellActive = false;
+		engine->ignitionState.edgeDwellUnstable = false;
+		engine->ignitionState.edgeDwellWindowValid = false;
+	}
+
 	if (engine->ignitionEvents.isReady) {
 		for (size_t i = 0; i < engineConfiguration->cylindersCount; i++) {
 			IgnitionEvent *event = &engine->ignitionEvents.elements[i];
@@ -623,6 +697,27 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 			if (std::isnan(sparkAngle)) {
 				warning(ObdCode::CUSTOM_ADVANCE_SPARK, "NaN advance");
 				continue;
+			}
+
+			bool edgeEvent = false;
+			if (edgeModeAllowed) {
+				const float cycle = engineCycleDeg;
+				const float tdcPhase = getPerCylinderFiringOrderOffset(event->cylinderIndex, event->coilIndex);
+				// a command below kEdgeMinAdvanceDeg BTDC keeps the legacy path for this event (never snapped to 18 ATDC)
+				if (edgedwell::edgeEligible(sparkAngle, tdcPhase, cycle)) {
+					// tooth choice depends only on the latched event angles + the fixed tooth table, so it cannot
+					// change between two teeth of the same cycle (no double / missed dwell schedule)
+					edgedwell::Plan plan = edgedwell::planForEvent(
+						[](size_t index) { return getTriggerCentral()->getToothEnginePhase(index); },
+						getTriggerCentral()->engineCycleEventCount, cycle, sparkAngle,
+						edgedwell::forwardDistance(dwellAngle, sparkAngle, cycle));
+					if (plan.valid) {
+						dwellAngle = plan.dwellPhase;
+						sparkAngle = plan.sparkPhase;
+						edgeEvent = true;
+						engine->ignitionState.edgeDwellActive = true;
+					}
+				}
 			}
 
 			bool isOddCylWastedEvent = false;
@@ -689,7 +784,7 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 */
 #endif // EFI_ANTILAG_SYSTEM
 
-			scheduleSparkEvent(limitedSpark, event, rpm, dwellMs, dwellAngle, sparkAngle, edgeTimestamp, currentPhase, nextPhase);
+			scheduleSparkEvent(limitedSpark, event, rpm, dwellMs, dwellAngle, sparkAngle, edgeTimestamp, currentPhase, nextPhase, edgeEvent);
 		}
 	}
 }
