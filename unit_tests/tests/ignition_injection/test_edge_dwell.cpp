@@ -1315,5 +1315,53 @@ TEST(edgeDwell, aSyncLossBetweenTheLegacyDwellToothAndTheEdgeDwellToothClearsThe
 	EXPECT_EQ(0, pendingAfter);
 	EXPECT_EQ(0, edgeSparksAfter);
 	Integrity i = integrity(t);
-	EXPECT_EQ(0, i.doubleCharge + i.doubleSpark);
+	EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling);
+
+	// from 24 teeth (one cycle) after the error on, the coil edges are today's legacy edges: same run, bits off from the
+	// start, the same trigger error at the same tooth
+	Profile refP = steady(210, 200);
+	refP.noise = 0.02f;
+	refP.seed = 11;
+	refP.beforeTooth = [&](size_t n) {
+		if (n == injectedAt) {
+			engine->triggerCentral.triggerState.onTriggerError();
+		}
+	};
+	Trace ref = runTrace(refP, false, []() { engineConfiguration->fixedTiming = 38.0f; });
+	ASSERT_GT(t.teeth.size(), injectedAt + 48);
+	auto tail = [&](const Trace& tr, size_t afterTeeth) {
+		std::vector<Coil> out;
+		efitick_t from = t.teeth[injectedAt + afterTeeth].nt;
+		for (const Coil& c : tr.coils) {
+			if (c.nt >= from) {
+				out.push_back(c);
+			}
+		}
+		return out;
+	};
+	// one cycle after the error: same edges, except that the event whose spark the sync loss cost (its legacy dwell tooth was
+	// already behind it when the decision was cleared) is not re-latched by its own spark callback (fireSparkAndPrepareNextSchedule),
+	// so its charge edge of the NEXT cycle comes from the previous cycle's latch: at most one charge edge, a few tens of us
+	std::vector<Coil> a24 = tail(t, 24);
+	std::vector<Coil> b24 = tail(ref, 24);
+	ASSERT_GE(a24.size(), 10u);
+	ASSERT_EQ(b24.size(), a24.size());
+	int differing = 0;
+	for (size_t k = 0; k < a24.size(); k++) {
+		if (a24[k].cyl != b24[k].cyl || a24[k].charge != b24[k].charge) {
+			differing += 100;
+		} else if (std::llround(NT2US((double)a24[k].nt)) != std::llround(NT2US((double)b24[k].nt))) {
+			differing++;
+			EXPECT_TRUE(a24[k].charge) << "only a charge edge may differ";
+			EXPECT_LT(std::fabs(NT2US((double)a24[k].nt) - NT2US((double)b24[k].nt)), 50.0);
+		}
+	}
+	EXPECT_LE(differing, 1);
+	// two cycles after the error: bit-identical to today's legacy schedule
+	Trace x, y;
+	x.coils = tail(t, 48);
+	y.coils = tail(ref, 48);
+	EXPECT_GE(x.coils.size(), 8u);
+	EXPECT_EQ(y.coils.size(), x.coils.size());
+	EXPECT_EQ(coilFingerprint(y), coilFingerprint(x)) << "after a sync loss the edge path must not leave a trace";
 }

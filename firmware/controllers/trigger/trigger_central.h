@@ -75,6 +75,8 @@ public:
 	/**
 	 * Sync loss, trigger error, phase re-sync and engine stop: the tooth window starts over AND every ignition event forgets
 	 * which path (legacy or edge) it was scheduled by this cycle, so a pending edge decision cannot outlive the sync it was made on.
+	 * Side effect: a trigger error inside the post-start window disarms the latch for the rest of that start (the window
+	 * restarts empty; safe direction, the legacy path runs).
 	 */
 	void resetEdgeDwellWindow();
 
