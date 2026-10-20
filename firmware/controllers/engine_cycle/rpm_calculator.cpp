@@ -283,6 +283,8 @@ void RpmCalculator::setStopSpinning() {
 	state = STOPPED;
 
 	engine->triggerCentral.resetEdgeDwellWindow();
+	// camEarlyRiseLatch: a latched cam rise and the "used" live bit belong to the run that just ended
+	engine->triggerCentral.resetCamEarlyRise(/*clearUsedFlag*/ true);
 
 	// Broadcast "engine stopped" to all engine modules so they can reset their own state
 	// (trigger sync, instant RPM history, schedulers, etc.). See Engine::onEngineStopped.

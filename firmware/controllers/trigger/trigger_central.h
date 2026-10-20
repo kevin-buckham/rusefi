@@ -83,6 +83,28 @@ public:
 	void resetEdgeDwellWindow();
 
 	/**
+	 * camEarlyRiseLatch: the one cam rise that arrived while the primary trigger was synchronized but engine speed
+	 * (oneDegreeUs) did not exist yet. What is kept is the primary synchronization COUNTER at the rise (never a time): the
+	 * counter based phase resolution only depends on the primary synchronization counter at the moment of the rise, see
+	 * applyLatchedCamRise(). Sync loss, trigger error, primary resync, engine stop, a newer rise, a rise processed
+	 * normally, and an age of crankDivider or more counter steps (one cam period) all drop it.
+	 */
+	struct CamEarlyRiseLatch {
+		bool valid = false;
+		int camIndex = 0;			// index of the cam input (INDEX_BY_BANK_CAM) the rise came from
+		int syncCounterAtRise = 0;	// primary synchronization counter when the rise arrived (the only phase information the counter based resolution needs)
+		float toothPhase = 0;		// m_lastToothPhaseFromSyncPoint when the rise arrived: only used for the C6675 warning angle
+		uint32_t elapsedUs = 0;		// time from that tooth to the rise: only used for the C6675 warning angle
+	};
+	CamEarlyRiseLatch camEarlyRise;
+
+	// called from handleVvtCamSignal when a rise arrives before RPM is known
+	void latchCamEarlyRise(int index, efitick_t nowNt);
+	void resetCamEarlyRise(bool clearUsedFlag);
+	// called at the end of handleShaftSignal for every decoded tooth, AFTER the RPM processing of that tooth
+	void applyLatchedCamRise();
+
+	/**
 	 * Engine phase of trigger event 'eventIndex', computed with exactly the same arithmetic as
 	 * currentEngineDecodedPhase / findNextTriggerToothAngle so that the value is bit-identical to what
 	 * mainTriggerCallback receives for that tooth.

@@ -150,6 +150,86 @@ void TriggerCentral::resetEdgeDwellWindow() {
 	}
 }
 
+static void processCamRisePhase(int index, angle_t angleFromPrimarySyncPoint, int singleToothRemainder);
+
+void TriggerCentral::resetCamEarlyRise(bool clearUsedFlag) {
+	camEarlyRise.valid = false;
+	if (clearUsedFlag) {
+		camEarlyRiseUsed = false;
+	}
+}
+
+void TriggerCentral::latchCamEarlyRise(int index, efitick_t nowNt) {
+	if (engineConfiguration->vvtMode[CAM_BY_INDEX(index)] != VVT_SINGLE_TOOTH) {
+		// only the single tooth cam is resolved by the counter alone, other decoders need their own sync tooth
+		return;
+	}
+	if (index != engineConfiguration->engineSyncCam) {
+		return;
+	}
+	if (!triggerState.getShaftSynchronized() || triggerState.hasSynchronizedPhase()) {
+		return;
+	}
+	if (getCrankDivider(getEngineRotationState()->getOperationMode()) <= 1) {
+		// no ambiguity to resolve
+		return;
+	}
+
+	CamEarlyRiseLatch l;
+	l.valid = true; // a newer rise simply replaces an older one
+	l.camIndex = index;
+	l.syncCounterAtRise = (int)triggerState.getSynchronizationCounter();
+	{
+		// under lock to avoid mismatched tooth phase and time, same as getCurrentEnginePhase
+		chibios_rt::CriticalSectionLocker csl;
+		l.elapsedUs = (uint32_t)m_lastToothTimer.getElapsedUs(nowNt);
+		l.toothPhase = m_lastToothPhaseFromSyncPoint;
+	}
+	camEarlyRise = l;
+}
+
+/**
+ * Why this equals the normal path. A live rise with synchronization counter C makes syncEnginePhase(divider, 0) add
+ * s = (-C) mod divider to the counter. The primary counter then simply keeps counting one step per trigger cycle, so
+ * n = (C_now - C) steps later the counter would read C_now + s. Asking syncEnginePhase for remainder (n mod divider)
+ * produces exactly that value: (C_now + t) mod divider == n mod divider  <=>  t == (n - C_now) mod divider == (-C) mod divider.
+ * No time is involved, so the late application has no interpolation error; the angle below only feeds the +-7 degree warning.
+ *
+ * It runs at the very end of handleShaftSignal, so the RPM sample of this tooth is already taken (a counter shift before that
+ * could re-time index 0 and delay the first RPM) and the tooth is processed exactly as if the rise had arrived right after it.
+ */
+void TriggerCentral::applyLatchedCamRise() {
+	if (!camEarlyRise.valid) {
+		return;
+	}
+	if (!engineConfiguration->camEarlyRiseLatch
+			|| !triggerState.getShaftSynchronized() || triggerState.hasSynchronizedPhase()) {
+		resetCamEarlyRise(false);
+		return;
+	}
+
+	int crankDivider = getCrankDivider(getEngineRotationState()->getOperationMode());
+	int n = (int)triggerState.getSynchronizationCounter() - camEarlyRise.syncCounterAtRise;
+	if (crankDivider <= 1 || n < 0 || n >= crankDivider) {
+		// older than one cam period (or the counter was reset under us): which revolution the rise was in is unknowable
+		resetCamEarlyRise(false);
+		return;
+	}
+
+	floatus_t oneDegreeUs = engine->rpmCalculator.oneDegreeUs;
+	if (std::isnan(oneDegreeUs) || oneDegreeUs <= 0) {
+		// still no RPM: keep waiting, the age check above bounds the wait
+		return;
+	}
+
+	CamEarlyRiseLatch l = camEarlyRise;
+	camEarlyRise.valid = false;
+
+	angle_t angleFromPrimarySyncPoint = l.toothPhase + l.elapsedUs / oneDegreeUs;
+	processCamRisePhase(l.camIndex, angleFromPrimarySyncPoint, n % crankDivider);
+	camEarlyRiseUsed = triggerState.hasSynchronizedPhase();
+}
+
 angle_t TriggerCentral::syncEnginePhaseAndReport(int divider, int remainder) {
 	angle_t engineCycle = getEngineCycle(getEngineRotationState()->getOperationMode());
 
@@ -194,7 +274,9 @@ PUBLIC_API_WEAK angle_t customAdjustCustom(TriggerCentral *tc, vvt_mode_e vvtMod
   return 0;
 }
 
-static angle_t adjustCrankPhase(int camIndex) {
+// 'singleToothRemainder' is only used by the single tooth cam: 0 for a live cam rise (counter % crankDivider == 0 at the
+// rise); a rise that was latched n teeth ago passes n % crankDivider, see TriggerCentral::applyLatchedCamRise
+static angle_t adjustCrankPhase(int camIndex, int singleToothRemainder = 0) {
 	float maxSyncThreshold = engineConfiguration->maxCamPhaseResolveRpm;
 	if (maxSyncThreshold != 0 && Sensor::getOrZero(SensorType::Rpm) > maxSyncThreshold) {
 		// The user has elected to stop trying to resolve crank phase after some RPM.
@@ -219,6 +301,7 @@ static angle_t adjustCrankPhase(int camIndex) {
 	case VVT_MITSUBISHI_4G63:
 		return tc->syncEnginePhaseAndReport(crankDivider, 1);
 	case VVT_SINGLE_TOOTH:
+		return tc->syncEnginePhaseAndReport(crankDivider, singleToothRemainder);
 	case VVT_NISSAN_VQ:
 	case VVT_BOSCH_QUICK_START:
 	case VVT_BMW_VANOS_RELUCTOR:
@@ -364,6 +447,7 @@ PUBLIC_API_WEAK bool skipToothSpecialShape(size_t index, vvt_mode_e vvtMode, ang
 	return false;
 }
 
+
 void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
 	TriggerCentral *tc = getTriggerCentral();
 	if (index == 0) {
@@ -426,10 +510,29 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
 	if (!currentPhase) {
 		// If we couldn't resolve engine speed (yet primary trigger is sync'd), this
 		// probably means that we have partial crank sync, but not RPM information yet
+		if (engineConfiguration->camEarlyRiseLatch) {
+			tc->latchCamEarlyRise(index, nowNt);
+		}
 		return;
 	}
 
-	angle_t angleFromPrimarySyncPoint = currentPhase.Value;
+	// a normally processed rise supersedes anything latched earlier (camEarlyRiseLatch)
+	tc->camEarlyRise.valid = false;
+
+	processCamRisePhase(index, currentPhase.Value, /*singleToothRemainder*/ 0);
+}
+
+/**
+ * Everything a cam rise does once the engine phase (angle since the primary sync point) is known. Shared by the live path
+ * (handleVvtCamSignal) and by TriggerCentral::applyLatchedCamRise.
+ */
+static void processCamRisePhase(int index, angle_t angleFromPrimarySyncPoint, int singleToothRemainder) {
+	TriggerCentral *tc = getTriggerCentral();
+	int bankIndex = BANK_BY_INDEX(index);
+	int camIndex = CAM_BY_INDEX(index);
+	TriggerDecoderBase& vvtDecoder = tc->vvtState[bankIndex][camIndex];
+	bool isVvtWithRealDecoder = vvtWithRealDecoder(engineConfiguration->vvtMode[camIndex]);
+
 	// convert trigger cycle angle into engine cycle angle
 	angle_t currentPosition = angleFromPrimarySyncPoint - tdcPosition();
 	// https://github.com/rusefi/rusefi/issues/1713 currentPosition could be negative that's expected
@@ -473,7 +576,7 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
 
 	// Only do engine sync using one cam, other cams just provide VVT position.
 	if (index == engineConfiguration->engineSyncCam) {
-		angle_t crankOffset = adjustCrankPhase(camIndex);
+		angle_t crankOffset = adjustCrankPhase(camIndex, singleToothRemainder);
 		// vvtPosition was calculated against wrong crank zero position. Now that we have adjusted crank position we
 		// shall adjust vvt position as well
 		vvtPosition -= crankOffset;
@@ -1036,9 +1139,14 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 		decodeMapCam(temp_mapVvt_index, timestamp, currentEngineDecodedPhase);
 
 		boardTriggerCallback(timestamp, currentEngineDecodedPhase);
+
+		// camEarlyRiseLatch: only now, after this tooth's RPM sample, is it safe to shift the counter
+		applyLatchedCamRise();
 	} else {
 		// without sync tooth phases mean nothing: the speed window must start over
 		resetEdgeDwellWindow();
+		// ... and a latched cam rise belonged to a sync that is gone
+		resetCamEarlyRise(false);
 
 		// We don't have sync, but report to the wave chart anyway as index 0.
 		reportEventToWaveChart(signal, 0, triggerShape.useOnlyRisingEdges);
