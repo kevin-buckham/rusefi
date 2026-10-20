@@ -543,8 +543,10 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 		// event was queued in relation to some expected tooth event in the future which might just never come so we shall protect from over-dwell
 		if (!limitedSpark) {
 			// auto fire spark at 1.5x nominal dwell (3x in tooth-locked cranking mode: an over-dwell fire there is an EARLY spark)
-			float overdwellFactor = edgeEvent ? edgedwell::kEdgeOverdwellFactor : edgedwell::kLegacyOverdwellFactor;
-			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(overdwellFactor * dwellMs));
+			float overdwellMs = edgeEvent
+				? std::max(edgedwell::kEdgeOverdwellFactor * dwellMs, edgedwell::kEdgeBackupMinMs)
+				: edgedwell::kLegacyOverdwellFactor * dwellMs;
+			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(overdwellMs));
 
 #if SPARK_EXTREME_LOGGING
 			efitimeus_t fireTimeUs = NT2US(fireTime);
@@ -764,6 +766,16 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 					// the legacy dwell tooth: the charge belongs to the later edge dwell tooth
 					event->edgeDwellCycleState = 2;
 				}
+				continue;
+			}
+			if (edgeEvent && getTriggerCentral()->toothWindow.lastUsPerDeg() <= 0) {
+				// No fresh tooth interval since the last window reset (sync loss / trigger error / phase re-sync / stop): the
+				// charge would fall to the stale 720-deg stored RPM (tier 3), which is up to ~3x too fast right after a crank
+				// slowdown, i.e. an EARLY spark. Refuse the charge for this event: nothing is scheduled (no charge, no spark =
+				// one lost spark, the safe direction), and the pending state is cleared so nothing is stranded. The legacy path
+				// is NOT used instead: it times by the same stale RPM and fires early the same way. The next cycle plans normally
+				// because the window has an interval again by then.
+				event->edgeDwellCycleState = 0;
 				continue;
 			}
 			if (edgePending) {

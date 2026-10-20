@@ -24,6 +24,14 @@ constexpr float kToothEpsDeg = 0.05f;
 constexpr float kLegacyOverdwellFactor = 1.5f;
 constexpr float kEdgeOverdwellFactor = 3.0f;
 
+// Edge-mode backup is max(kEdgeOverdwellFactor x dwell, kEdgeBackupMinMs). With 30 deg teeth a LEGITIMATE charge from the
+// dwell tooth (42 BTDC) to the spark tooth (12 BTDC) lasts ~33 ms at 150 rpm, so a 13.5 ms (3 x 4.5) backup fires before the
+// tooth on any slowdown: in edge mode the backup is the only early-spark path. 40 ms absolute (~7 percent duty on a 119 ms
+// coil cycle at 210 rpm) keeps it above every legitimate charge. ASSUMPTION (public data only: stock D17 dwell 2.5 ms, Honda
+// 20.8 percent duty limit, coils reported self-protected): the D17A2 current-limits or soft-shuts-off and does NOT force-fire
+// a charged coil within 40 ms. Legacy events keep kLegacyOverdwellFactor x dwell unchanged.
+constexpr float kEdgeBackupMinMs = 40.0f;
+
 // Edge mode is used for an ignition event only when its COMMANDED advance is at least this many degrees BTDC. Below it
 // the tooth at or after the command would be the 18 ATDC tooth (up to 29 deg of retard), so the event keeps the legacy
 // time-scheduled path (owner decision 2026-10-17, replaces the earlier 12 BTDC floor). With crankingAdvance 0/14/16/16

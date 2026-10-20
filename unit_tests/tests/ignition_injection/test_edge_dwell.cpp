@@ -405,8 +405,28 @@ TEST(edgeDwell, edgeModeIsInactiveOnRisingAndFallingWheelsAndWithOddFireWastedSp
 	}
 }
 
+namespace {
+
+// After a window reset the edge charge of the event at its dwell tooth is REFUSED (no fresh tooth interval), which costs that one
+// spark (a lost spark = misfire, the safe direction). So the run may have exactly 0 or 1 spark fewer than the same run with the
+// bit never on, and every spark it does deliver is either never earlier than commanded or today's legacy spark (same cylinder,
+// same time within 3 ms, same angle error).
+void expectAtMostOneLostSparkAndNeverEarlierThanToday(const std::vector<Spark>& a, const std::vector<Spark>& b, const std::string& what) {
+	ASSERT_GE(a.size() + 1, b.size()) << "more than one spark lost, " << what;
+	ASSERT_LE(a.size(), b.size()) << "a spark was added, " << what;
+	for (size_t k = 0; k < a.size(); k++) {
+		bool sameAsToday = false;
+		for (const Spark& o : b) {
+			sameAsToday |= o.cyl == a[k].cyl && std::fabs(o.tUs - a[k].tUs) < 3000 && std::fabs(o.errDeg - a[k].errDeg) < 0.5;
+		}
+		EXPECT_TRUE(a[k].errDeg >= -0.06 || sameAsToday) << what << " spark " << k << " err " << a[k].errDeg;
+	}
+}
+
+} // namespace
+
 TEST(edgeDwell, switchingTheBitOnMidCrankNeverDoublesStrandsOrAdvancesASpark) {
-	// the window is not fed while the bit is off, so it is empty when the bit is turned on: no early spark, no skipped spark
+	// the window is not fed while the bit is off, so it is empty when the bit is turned on: no early spark, at most the one refused charge lost
 	for (int n = 40; n < 64; n += 3) {
 		Profile p = steady(210, 120);
 		p.noise = 0.03f;
@@ -439,12 +459,8 @@ TEST(edgeDwell, switchingTheBitOnMidCrankNeverDoublesStrandsOrAdvancesASpark) {
 		EXPECT_EQ(0, t.sparkOutOfOrder) << n;
 		auto a = analyze(t);
 		auto b = analyze(off);
-		ASSERT_EQ(b.size(), a.size()) << "a spark was skipped or added, switched at tooth " << n;
-		for (size_t k = 0; k < a.size(); k++) {
-			// an edge-path spark is never earlier than commanded; a legacy one is exactly today's
-			EXPECT_TRUE(a[k].errDeg >= -0.06 || std::fabs(a[k].errDeg - b[k].errDeg) < 0.5)
-				<< "switched at tooth " << n << " spark " << k << " err " << a[k].errDeg << " legacy " << b[k].errDeg;
-		}
+		// the bit going on empties the window: the first edge charge after it is refused (one lost spark at most)
+		expectAtMostOneLostSparkAndNeverEarlierThanToday(a, b, "switched at tooth " + std::to_string(n));
 	}
 }
 
@@ -473,12 +489,8 @@ TEST(edgeDwell, theModeDroppingOrRisingBetweenTheLegacyAndTheEdgeDwellToothNever
 				EXPECT_EQ(0, t.sparkOutOfOrder) << what;
 				auto a = analyze(t);
 				auto b = analyze(ref);
-				ASSERT_EQ(b.size(), a.size()) << "a spark was skipped or added, " << what;
-				for (size_t k = 0; k < a.size(); k++) {
-					// an edge-path spark is never earlier than commanded; a legacy-path one is what today delivers
-					EXPECT_TRUE(a[k].errDeg >= -0.06 || std::fabs(a[k].errDeg - b[k].errDeg) < 0.5)
-						<< what << " spark " << k << " err " << a[k].errDeg << " legacy " << b[k].errDeg;
-				}
+				// direction 1 turns the bit on, which empties the window: the first edge charge after it is refused (one lost spark at most)
+				expectAtMostOneLostSparkAndNeverEarlierThanToday(a, b, what);
 			}
 		}
 	}
@@ -493,7 +505,9 @@ TEST(edgeDwell, overDwellBackupIsNeverWorseThanTodaysDeliveredAngleAt120And150An
 	const Row rows[] = {
 		{120, 8.4, {9.6, 10.2, 10.8, 12.0}, {9.6, 10.2, 10.8, 12.0}},
 		{150, 10.5, {19.7, 25.2, 30.8, 42.0}, {19.7, 25.2, 30.8, 42.0}},
-		{210, 14.1, {14.4, 21.3, 28.2, 42.0}, {23.4, 28.0, 32.7, 42.0}},
+		// edge column with the 40 ms backup (was 14.4 / 21.3 / 28.2 / 42.0 with the 13.5 ms one): k = 1.5 and 2 now sit on the 12 BTDC
+		// tooth lock; k = 3 (70 rpm) and 4 (52 rpm) still reach the 40 ms backup because a 30 deg tooth takes 71 / 96 ms there
+		{210, 14.1, {12.0, 12.0, 17.1, 42.0}, {23.4, 28.0, 32.7, 42.0}},
 	};
 	for (const Row& r : rows) {
 		int ki = 0;
@@ -509,6 +523,9 @@ TEST(edgeDwell, overDwellBackupIsNeverWorseThanTodaysDeliveredAngleAt120And150An
 			EXPECT_LE(edge, today + 0.05) << "edge mode worse than today's delivered angle at " << r.rpm << " rpm k=" << k;
 			if (legacy) {
 				EXPECT_NEAR(edge, today, 0.01) << r.rpm << " " << k << ": below 12 BTDC the path must be today's";
+			} else if (k < 2.5) {
+				EXPECT_LE(edge, 12.0 + 0.06) << r.rpm << " " << k << ": the 40 ms backup must never fire before the tooth in a 1.5x / 2x slowdown";
+				EXPECT_EQ(0, caps) << r.rpm << " " << k;
 			}
 		}
 	}
@@ -600,7 +617,8 @@ TEST(edgeDwell, alternatingFireNoFireImpulseSweepFindsTheBreakingThreshold) {
 	// one stroke fires and the next does not, amplitude 10..50 percent of speed in 2.5 percent steps, three scenarios,
 	// ripple +-30 and +-50 percent. 180-deg stroke-twin predictor only.
 	for (double ripple : {0.30, 0.50}) {
-		double firstEarly = 0, firstEarlyDeliveredBtdc = 0, firstAdvancedBtdc = 0, firstAdvancedAt = 0, firstPastMargin = 0;
+		double firstEarly = 0, firstEarlyDeliveredBtdc = 0, firstAdvancedBtdc = 0, firstAdvancedAt = 0, firstPastMargin = 0, maxDwellSeen = 0;
+		int legacyOwnedEarly = 0;
 		for (int i = 4; i <= 20; i++) {
 			float impulse = 0.025f * i;
 			SweepStats all;
@@ -621,25 +639,37 @@ TEST(edgeDwell, alternatingFireNoFireImpulseSweepFindsTheBreakingThreshold) {
 				firstAdvancedBtdc = deliveredBtdc;
 				firstAdvancedAt = impulse;
 			}
-			// measured: +-30 percent ripple holds the tooth lock up to 25 percent and the dwell margin up to 22.5 percent;
-			// +-50 percent ripple breaks earlier (first early spark at 22.5 percent), so the asserted range is 20 percent there
-			float lockLimit = ripple < 0.4 ? 0.25f : 0.20f;
-			float marginLimit = ripple < 0.4 ? 0.225f : 0.20f;
-			if (impulse <= lockLimit + 1e-6f) {
-				EXPECT_EQ(0, all.early) << impulse << " ripple " << ripple;
+			// measured with the 40 ms backup (13.5 ms before: first early spark at 27.5 percent at +-30 ripple, 22.5 at +-50): early sparks are
+			// counted for EDGE-owned sparks only (an event the legacy path scheduled while the mode gate was down is today's behaviour:
+			// 9 such sparks at +-30 ripple / 42.5 percent, all with a 1.3 ms dwell, none from the backup). +-30 ripple has no edge-path early
+			// spark anywhere up to 50 percent; +-50 ripple holds up to 47.5 percent and has 3 sparks at 50 percent that the 40 ms backup
+			// fired 0.4 deg (12.4 BTDC against the 12 tooth lock) early. The lost-spark limits are the old ones (unchanged: 12 percent
+			// and 3 in a row up to 25 / 20 percent impulse).
+			float lostLimit = ripple < 0.4 ? 0.25f : 0.20f;
+			float lockLimit = ripple < 0.4 ? 0.50f : 0.475f;
+			float marginLimit = ripple < 0.4 ? 0.40f : 0.475f;
+			if (impulse <= lostLimit + 1e-6f) {
 				EXPECT_LE(all.maxConsecutiveLost, 3) << impulse << " ripple " << ripple;
 				EXPECT_LE(all.lostPercent(), 12.0) << impulse << " ripple " << ripple;
+			}
+			if (impulse <= lockLimit + 1e-6f) {
+				EXPECT_EQ(0, all.early) << impulse << " ripple " << ripple;
+				EXPECT_LE(deliveredBtdc, 12.0 + 0.06) << impulse << " ripple " << ripple;
 			}
 			if (impulse <= marginLimit + 1e-6f) {
 				EXPECT_LE(all.maxDwellMs, kBackupMs - kBackupMarginMs) << impulse << " ripple " << ripple;
 			}
+			maxDwellSeen = std::max(maxDwellSeen, all.maxDwellMs);
+			legacyOwnedEarly += all.earlyLegacyOwned;
 		}
-		printf("BREAKING THRESHOLD (alternating impulse, ripple +-%.0f%%, 180-deg twin only): first early spark at %.1f%% delivered %.1f BTDC (tooth lock 12, commanded 14); first spark more advanced than commanded at %.1f%% (%.1f BTDC); first dwell past the %.1f ms margin limit at %.1f%%\n",
-			ripple * 100, firstEarly * 100, firstEarlyDeliveredBtdc, firstAdvancedAt * 100, firstAdvancedBtdc, kBackupMs - kBackupMarginMs, firstPastMargin * 100);
-		EXPECT_NEAR(ripple < 0.4 ? 0.275 : 0.225, firstEarly, 1e-6) << ripple;
-		EXPECT_NEAR(ripple < 0.4 ? 13.2 : 14.6, firstEarlyDeliveredBtdc, 0.3) << ripple;
-		EXPECT_NEAR(ripple < 0.4 ? 0.30 : 0.225, firstAdvancedAt, 1e-6) << ripple;
-		EXPECT_NEAR(ripple < 0.4 ? 0.25 : 0.225, firstPastMargin, 1e-6) << ripple;
+		printf("BREAKING THRESHOLD (alternating impulse, ripple +-%.0f%%, 180-deg twin only): first edge-path early spark at %.1f%% delivered %.1f BTDC (tooth lock 12, commanded 14) [0 = none up to 50%%]; first spark more advanced than commanded at %.1f%% (%.1f BTDC); first dwell past the %.1f ms margin limit at %.1f%%; max dwell over the sweep %.1f ms; legacy-owned early sparks %d\n",
+			ripple * 100, firstEarly * 100, firstEarlyDeliveredBtdc, firstAdvancedAt * 100, firstAdvancedBtdc, kBackupMs - kBackupMarginMs, firstPastMargin * 100, maxDwellSeen, legacyOwnedEarly);
+		EXPECT_NEAR(ripple < 0.4 ? 0.0 : 0.50, firstEarly, 1e-6) << ripple;
+		EXPECT_NEAR(ripple < 0.4 ? 0.0 : 12.4, firstEarlyDeliveredBtdc, 0.3) << ripple;
+		EXPECT_NEAR(0.0, firstAdvancedAt, 1e-6) << ripple; // never more advanced than the 14 BTDC command
+		EXPECT_NEAR(ripple < 0.4 ? 0.425 : 0.50, firstPastMargin, 1e-6) << ripple;
+		EXPECT_LE(maxDwellSeen, kBackupMs + 0.01) << ripple; // the 40 ms backup is the hard ceiling (reached only at +-50 ripple / 50 percent)
+		EXPECT_GE(maxDwellSeen, ripple < 0.4 ? 37.0 : 39.9) << ripple;
 	}
 }
 
@@ -1493,4 +1523,84 @@ TEST(edgeDwell, switchingABitOffToOnResetsTheWindowButNotALegacyOwnedEvent) {
 		EXPECT_EQ(1, getIgnitionEvents()->elements[0].edgeDwellCycleState) << which;
 		EXPECT_NE(2, getIgnitionEvents()->elements[1].edgeDwellCycleState) << which;
 	}
+}
+
+namespace {
+
+// Right after a window reset (sync loss / trigger error / phase re-sync / stop) the window has no interval, so the charge would fall
+// to the stored 720-deg RPM. The crank really runs at 150 rpm while the stored value says 450 (stale-high by 3x, held for the 24 teeth
+// after the reset by overwriting oneDegreeUs, which is what a stale RPM cache is): the stale charge starts ~3x too early. With a 13.5 ms
+// backup that ended as an early spark at ~23 BTDC against 16 commanded; with the 40 ms backup it is a ~26 ms over-dwell instead.
+// mode 0 = onTriggerError, 1 = the window reset a phase re-sync performs. Injected at 24 consecutive tooth positions.
+struct StaleResetResult {
+	int refused = 0;       // sparks the reset cost over the same run without it (the refused charges)
+	int early = 0;         // charged sparks earlier than commanded
+	double maxDwellMs = 0; // longest charge after the reset
+	double minErrDeg = 99;
+};
+
+StaleResetResult resetWithStaleHighStoredRpm(int mode) {
+	StaleResetResult r;
+	const float staleOneDegreeUs = 1e6f / (450.0f * 6.0f);
+	for (int n = 82; n < 106; n++) {
+		Profile p = steady(150, 160);
+		p.ripple = 0.1f;
+		p.noise = 0.02f;
+		p.seed = 3;
+		p.beforeTooth = [=](size_t i) {
+			if ((int)i == n) {
+				if (mode == 0) {
+					engine->triggerCentral.triggerState.onTriggerError();
+				} else {
+					engine->triggerCentral.resetEdgeDwellWindow();
+				}
+			}
+			if ((int)i >= n && (int)i < n + 24) {
+				engine->rpmCalculator.oneDegreeUs = staleOneDegreeUs;
+			}
+		};
+		Profile refP = p;
+		refP.beforeTooth = nullptr;
+		Trace t = runTrace(p, true);
+		Trace ref = runTrace(refP, true);
+		const std::string what = std::string(mode == 0 ? "trigger error" : "phase re-sync reset") + " before tooth " + std::to_string(n);
+		EXPECT_GT(t.teeth.size(), (size_t)n + 40) << what;
+		efitick_t at = t.teeth[n - 1].nt;
+		Integrity i = integrity(t);
+		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << what << ": a stranded or doubled charge";
+		EXPECT_EQ(0, i.noCharge) << what << ": a spark without a charge";
+		auto a = analyze(t);
+		for (const Spark& s : a) {
+			if (NT2US((double)at) > s.tUs || s.dwellMs < 0) {
+				continue;
+			}
+			r.minErrDeg = std::min(r.minErrDeg, s.errDeg);
+			r.maxDwellMs = std::max(r.maxDwellMs, s.dwellMs);
+			r.early += s.errDeg < -0.06;
+		}
+		auto b = analyze(ref);
+		EXPECT_LE(b.size() > a.size() ? b.size() - a.size() : 0, 1u) << what << ": the reset costs at most the one refused spark";
+		r.refused += (int)(b.size() > a.size() ? b.size() - a.size() : 0);
+	}
+	return r;
+}
+
+} // namespace
+
+TEST(edgeDwell, aTriggerErrorWithTheStoredRpmStaleHighNeverFiresEarlyOrStrandsAChargeAfterTheReset) {
+	StaleResetResult r = resetWithStaleHighStoredRpm(0);
+	printf("trigger error x24 positions, stored 450 vs real 150: refused sparks %d, early %d, min err %.2f deg, max dwell %.1f ms\n", r.refused, r.early, r.minErrDeg, r.maxDwellMs);
+	EXPECT_EQ(0, r.early);
+	EXPECT_GE(r.minErrDeg, -0.06);
+	EXPECT_GT(r.refused, 0) << "the refusal never acted: the scenario does not reach the empty-window dwell tooth";
+	EXPECT_LE(r.maxDwellMs, 30.0); // stale tier-3 charge in the first teeth after the reset: an over-dwell, not an early spark (backup is 40 ms)
+}
+
+TEST(edgeDwell, aPhaseResyncWithTheStoredRpmStaleHighNeverFiresEarlyOrStrandsAChargeAfterTheReset) {
+	StaleResetResult r = resetWithStaleHighStoredRpm(1);
+	printf("phase re-sync x24 positions, stored 450 vs real 150: refused sparks %d, early %d, min err %.2f deg, max dwell %.1f ms\n", r.refused, r.early, r.minErrDeg, r.maxDwellMs);
+	EXPECT_EQ(0, r.early);
+	EXPECT_GE(r.minErrDeg, -0.06);
+	EXPECT_GT(r.refused, 0) << "the refusal never acted: the scenario does not reach the empty-window dwell tooth";
+	EXPECT_LE(r.maxDwellMs, 30.0);
 }

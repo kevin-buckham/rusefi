@@ -175,6 +175,8 @@ TEST(edgeDwellMath, theInstabilityConstantsAreTheMitsubishiOnesAndMatchTheWindow
 	EXPECT_EQ(0.1875f, kInstabilityRatio);
 	EXPECT_EQ(1400.0f, kInstabilityRpm);
 	EXPECT_EQ(3.0f, kEdgeOverdwellFactor);
+	EXPECT_EQ(1.5f, kLegacyOverdwellFactor);
+	EXPECT_EQ(40.0f, kEdgeBackupMinMs); // test_edge_dwell.cpp / edge_dwell_sweep.h repeat this literal as kBackupMinMs
 	EXPECT_EQ(12.0f, kEdgeMinAdvanceDeg);
 	EXPECT_EQ(8, kPostStartWindowEvents);
 }

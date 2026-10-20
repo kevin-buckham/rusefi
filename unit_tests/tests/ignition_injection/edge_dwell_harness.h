@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <vector>
 
 namespace edgetest {
@@ -38,6 +39,7 @@ struct Coil {
 };
 
 struct Trace {
+	std::map<uint32_t, bool> edgeOwned; // spark counter -> scheduled by the edge path (false = legacy path, even with edge mode on)
 	std::vector<Tooth> teeth;
 	std::vector<Coil> coils;
 	int sparkOutOfOrder = 0;
@@ -50,6 +52,7 @@ struct Spark {
 	double errDeg;   // delivered minus commanded: positive = later (retarded), negative = EARLIER than commanded
 	double dwellMs;  // -1 if the coil was never charged for this spark
 	double plannedMs;
+	bool edge = false; // scheduled by the edge path (ownership recorded when the event was scheduled)
 };
 
 struct Profile {
@@ -109,6 +112,10 @@ inline void fireTooth(EngineTestHelper& eth, Trace& t) {
 inline void drive(EngineTestHelper& eth, Trace& t, const Profile& p) {
 	engine->onIgnitionEvent = [&t](IgnitionEvent* e, bool state) {
 		t.coils.push_back({e->cylinderIndex, state, getTimeNowNt(), e->sparkAngle, (float)e->sparkDwell, e->sparkCounter});
+	};
+	engine->onScheduleTurnSparkPinHighStartCharging = [&t](const IgnitionEvent& e, efitick_t, angle_t, efitick_t) {
+		// called from scheduleSparkEvent right after the per-spark live bit was set for THIS event
+		t.edgeOwned[e.sparkCounter] = engine->ignitionState.edgeDwellSparkEdge;
 	};
 	uint32_t seed = p.seed;
 	float phase = 0;
@@ -194,7 +201,8 @@ inline std::vector<Spark> analyze(const Trace& r) {
 		if (err <= -360) {
 			err += 720;
 		}
-		out.push_back({lo.cyl, t, err, dwell, lo.plannedDwellMs});
+		auto own = r.edgeOwned.find(lo.counter);
+		out.push_back({lo.cyl, t, err, dwell, lo.plannedDwellMs, own != r.edgeOwned.end() && own->second});
 	}
 	return out;
 }

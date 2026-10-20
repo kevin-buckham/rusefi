@@ -20,8 +20,9 @@
 namespace edgetest {
 
 constexpr double kCrankDwellMs = 4.5;       // the tune's ignitionDwellForCrankingMs since 2026-10-17
-constexpr double kBackupFactor = 3.0;       // edge-mode over-dwell backup = 3 x configured dwell
-constexpr double kBackupMs = kBackupFactor * kCrankDwellMs;
+constexpr double kBackupFactor = 3.0;       // edge-mode over-dwell backup = max(3 x configured dwell, kBackupMinMs)
+constexpr double kBackupMinMs = 40.0;       // = edgedwell::kEdgeBackupMinMs (pinned in test_edge_dwell_math.cpp)
+constexpr double kBackupMs = std::max(kBackupFactor * kCrankDwellMs, kBackupMinMs);
 constexpr double kBackupMarginMs = 2.0;     // DA#4: max dwell must stay at least this far below the backup
 constexpr double kLockedErrDeg = 2.0;       // commanded 14 BTDC -> the 12 BTDC tooth is 2 deg later
 
@@ -103,7 +104,9 @@ struct SweepStats {
 	int sparks = 0;
 	int uncharged = 0;      // spark with no coil charge before it (a lost spark: misfire, the safe direction)
 	int maxConsecutiveLost = 0; // longest run of back-to-back lost sparks (cylinder events in firing order) in any one run
-	int early = 0;          // spark delivered more advanced than the tooth lock (kLockedErrDeg - 0.05)
+	int early = 0;          // EDGE-path spark delivered more advanced than the tooth lock (kLockedErrDeg - 0.05); with edge = false: earlier than commanded
+	int earlyLegacyOwned = 0; // same test, but the event was scheduled by the LEGACY path while edge mode was on (today's behaviour for that spark)
+	int edgeSparks = 0;     // sparks (charged) scheduled by the edge path
 	int pastMargin = 0;     // actual dwell above backup - margin
 	double maxDwellMs = 0;
 	double minErrDeg = 99;  // most advanced delivered spark, delivered minus commanded (negative = earlier than commanded)
@@ -113,6 +116,8 @@ struct SweepStats {
 		uncharged += o.uncharged;
 		maxConsecutiveLost = std::max(maxConsecutiveLost, o.maxConsecutiveLost);
 		early += o.early;
+		earlyLegacyOwned += o.earlyLegacyOwned;
+		edgeSparks += o.edgeSparks;
 		pastMargin += o.pastMargin;
 		maxDwellMs = std::max(maxDwellMs, o.maxDwellMs);
 		minErrDeg = std::min(minErrDeg, o.minErrDeg);
@@ -151,13 +156,20 @@ inline SweepStats sweep(const Profile& scenario, double ripple, int impulseMode,
 				}
 				run = 0;
 				st.maxDwellMs = std::max(st.maxDwellMs, s.dwellMs);
-				st.minErrDeg = std::min(st.minErrDeg, s.errDeg);
-				st.maxErrDeg = std::max(st.maxErrDeg, s.errDeg);
+				if (!edge || s.edge) { // delivered-angle range of the path under test (edge: edge-owned sparks only)
+					st.minErrDeg = std::min(st.minErrDeg, s.errDeg);
+					st.maxErrDeg = std::max(st.maxErrDeg, s.errDeg);
+				}
 				if (s.dwellMs > kBackupMs - kBackupMarginMs) {
 					st.pastMargin++;
 				}
+				st.edgeSparks += s.edge;
 				if (s.errDeg < (edge ? kLockedErrDeg - 0.05 : -0.05)) {
-					st.early++;
+					if (edge && !s.edge) {
+						st.earlyLegacyOwned++;
+					} else {
+						st.early++;
+					}
 				}
 			}
 		}
