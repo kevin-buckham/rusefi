@@ -26,6 +26,7 @@ TESTS_SRC_CPP = \
 	tests/trigger/test_real_nissan_maxima.cpp \
 	tests/trigger/test_real_bmw_e90_cam.cpp \
 	tests/trigger/test_real_cas_24_plus_1.cpp \
+	tests/trigger/test_cam_early_rise_latch.cpp \
 	tests/trigger/test_real_4b11.cpp \
 	tests/trigger/test_real_4g93.cpp \
 	tests/trigger/test_real_6g72_3000gt.cpp \
