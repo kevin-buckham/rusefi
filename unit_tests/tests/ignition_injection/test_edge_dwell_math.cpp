@@ -214,3 +214,11 @@ TEST(edgeDwellMath, nonFiniteInputsRefuseTheEdgeChargeInsteadOfChargingNow) {
 	// good inputs are never refused
 	EXPECT_GE(dwellStartDelayUs(30, 4.5f, 3000, 0, 0, 800), 0);
 }
+
+TEST(edgeDwellMath, theEdgeBackupIsFortyMsWhileCrankingAndAtMostThreeTimesDwellOnceRunning) {
+	EXPECT_EQ(40.0f, edgeBackupMs(4.5f, true));
+	EXPECT_EQ(13.5f, edgeBackupMs(4.5f, false));
+	EXPECT_EQ(45.0f, edgeBackupMs(15.0f, true));  // 3 x dwell above the floor: cranking keeps the larger
+	EXPECT_EQ(40.0f, edgeBackupMs(15.0f, false)); // RUNNING never exceeds 40 ms
+	EXPECT_EQ(30.0f, edgeBackupMs(10.0f, false));
+}

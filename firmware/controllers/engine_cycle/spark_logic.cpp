@@ -542,9 +542,9 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 	} else {
 		// event was queued in relation to some expected tooth event in the future which might just never come so we shall protect from over-dwell
 		if (!limitedSpark) {
-			// auto fire spark at 1.5x nominal dwell (3x in tooth-locked cranking mode: an over-dwell fire there is an EARLY spark)
+			// auto fire spark at 1.5x nominal dwell (edge events: max(3x dwell, 40 ms) while CRANKING, min(40 ms, 3x dwell) once RUNNING, see edgedwell::edgeBackupMs: an over-dwell fire there is an EARLY spark)
 			float overdwellMs = edgeEvent
-				? std::max(edgedwell::kEdgeOverdwellFactor * dwellMs, edgedwell::kEdgeBackupMinMs)
+				? edgedwell::edgeBackupMs(dwellMs, engine->rpmCalculator.getState() == CRANKING)
 				: edgedwell::kLegacyOverdwellFactor * dwellMs;
 			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(overdwellMs));
 

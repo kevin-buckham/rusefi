@@ -111,6 +111,7 @@ struct SweepStats {
 	double maxDwellMs = 0;
 	double minErrDeg = 99;  // most advanced delivered spark, delivered minus commanded (negative = earlier than commanded)
 	double maxErrDeg = -99; // latest delivered spark
+	double minErrAllDeg = 99; // most advanced delivered spark over ALL charged sparks (edge and legacy-owned), printed only
 	void add(const SweepStats& o) {
 		sparks += o.sparks;
 		uncharged += o.uncharged;
@@ -121,6 +122,7 @@ struct SweepStats {
 		pastMargin += o.pastMargin;
 		maxDwellMs = std::max(maxDwellMs, o.maxDwellMs);
 		minErrDeg = std::min(minErrDeg, o.minErrDeg);
+		minErrAllDeg = std::min(minErrAllDeg, o.minErrAllDeg);
 		maxErrDeg = std::max(maxErrDeg, o.maxErrDeg);
 	}
 	double lostPercent() const {
@@ -164,6 +166,7 @@ inline SweepStats sweep(const Profile& scenario, double ripple, int impulseMode,
 					st.pastMargin++;
 				}
 				st.edgeSparks += s.edge;
+				st.minErrAllDeg = std::min(st.minErrAllDeg, s.errDeg);
 				if (s.errDeg < (edge ? kLockedErrDeg - 0.05 : -0.05)) {
 					if (edge && !s.edge) {
 						st.earlyLegacyOwned++;

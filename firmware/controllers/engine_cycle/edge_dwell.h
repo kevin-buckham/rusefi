@@ -20,7 +20,7 @@ namespace edgedwell {
 constexpr float kToothEpsDeg = 0.05f;
 
 // over-dwell backup: legacy firing is at 1.5x dwell. In edge mode the backup would deliver an EARLY spark
-// (opening a charged coil always sparks), so it is pushed out to 3x dwell (13.5 ms at the tune's 4.5 ms cranking dwell).
+// (opening a charged coil always sparks), so it is pushed out: see edgeBackupMs() (40 ms while CRANKING, 3x dwell once RUNNING).
 constexpr float kLegacyOverdwellFactor = 1.5f;
 constexpr float kEdgeOverdwellFactor = 3.0f;
 
@@ -31,6 +31,16 @@ constexpr float kEdgeOverdwellFactor = 3.0f;
 // 20.8 percent duty limit, coils reported self-protected): the D17A2 current-limits or soft-shuts-off and does NOT force-fire
 // a charged coil within 40 ms. Legacy events keep kLegacyOverdwellFactor x dwell unchanged.
 constexpr float kEdgeBackupMinMs = 40.0f;
+
+/**
+ * Edge-event over-dwell backup delay. CRANKING: max(3 x dwell, 40 ms). Once the engine state is RUNNING (an edge-pending event carried
+ * over the switch, the post-start latch) the cap is min(40 ms, 3 x dwell): at 800 rpm one stroke is only 37.5 ms and the single shared
+ * coil must never stay charged across the next cylinder's event after a missed spark tooth.
+ */
+inline float edgeBackupMs(float dwellMs, bool cranking) {
+	const float threeX = kEdgeOverdwellFactor * dwellMs;
+	return cranking ? (threeX > kEdgeBackupMinMs ? threeX : kEdgeBackupMinMs) : (threeX < kEdgeBackupMinMs ? threeX : kEdgeBackupMinMs);
+}
 
 // Edge mode is used for an ignition event only when its COMMANDED advance is at least this many degrees BTDC. Below it
 // the tooth at or after the command would be the 18 ATDC tooth (up to 29 deg of retard), so the event keeps the legacy

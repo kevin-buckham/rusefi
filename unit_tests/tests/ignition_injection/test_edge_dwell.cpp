@@ -571,6 +571,8 @@ static void checkSweepsAtRipple(double ripple) {
 		for (const Sc& sc : scenarios) {
 			SweepStats st = sweep(sc.p, ripple, row.impulseMode, row.impulse);
 			SweepStats today = sweep(sc.p, ripple, row.impulseMode, row.impulse, false);
+			printf("sweep ripple +-%.0f%% %-18s %-17s: ALL sparks (edge+legacy-owned) most advanced %.1f deg vs command with the bit on, %.1f bits off\n",
+				ripple * 100, row.name, sc.name, st.minErrAllDeg, today.minErrDeg);
 			printf("sweep ripple +-%.0f%% %-18s %-17s: %4d sparks, lost %3d (%.1f%%, max %d in a row), early %d, max dwell %.1f ms (backup %.1f), past margin %d | today: lost %d, delivered %.1f..%.1f deg vs command, %d earlier than commanded\n",
 				ripple * 100, row.name, sc.name, st.sparks, st.uncharged, st.lostPercent(), st.maxConsecutiveLost, st.early, st.maxDwellMs, kBackupMs, st.pastMargin,
 				today.uncharged, today.minErrDeg, today.maxErrDeg, today.early);
@@ -659,6 +661,7 @@ TEST(edgeDwell, alternatingFireNoFireImpulseSweepFindsTheBreakingThreshold) {
 			if (impulse <= marginLimit + 1e-6f) {
 				EXPECT_LE(all.maxDwellMs, kBackupMs - kBackupMarginMs) << impulse << " ripple " << ripple;
 			}
+			printf("  alternating +-%.1f%% (ripple +-%.0f%%): most advanced over ALL sparks (edge + legacy-owned) %.1f deg vs command\n", impulse * 100, ripple * 100, all.minErrAllDeg);
 			maxDwellSeen = std::max(maxDwellSeen, all.maxDwellMs);
 			legacyOwnedEarly += all.earlyLegacyOwned;
 		}
@@ -1604,3 +1607,55 @@ TEST(edgeDwell, aPhaseResyncWithTheStoredRpmStaleHighNeverFiresEarlyOrStrandsACh
 	EXPECT_GT(r.refused, 0) << "the refusal never acted: the scenario does not reach the empty-window dwell tooth";
 	EXPECT_LE(r.maxDwellMs, 30.0);
 }
+
+TEST(edgeDwell, anEdgeEventScheduledAfterTheSwitchToRunningWithAMissedSparkToothFiresItsBackupAtThreeTimesDwellAndNeverOverlapsTheNextCharge) {
+	// 210 rpm cranking, flash to 800 (state -> RUNNING), a spark tooth missed at every position around the switch. Edge events still
+	// pending/latched when the state is RUNNING get min(40 ms, 3 x dwell) = 13.5 ms, so the single shared coil is never held across the
+	// next cylinder's event (one stroke at 800 rpm is 37.5 ms).
+	int runningEdgeCharges = 0, reachedRunning = 0;
+	for (int miss = 62; miss < 112; miss++) {
+		// the post-start latch (edge bit + latch bit) is what schedules edge events while the state is RUNNING: abrupt slowdown after the catch
+		Profile p = postSwitchStart(0.88);
+		p.missedTooth = miss;
+		std::vector<int> stateAt;
+		p.afterTooth = [&](size_t) { stateAt.push_back((int)engine->rpmCalculator.getState()); };
+		Bits bits;
+		bits.edge = true;
+		bits.latch = true;
+		Trace t = runTraceBits(p, bits, []() { engineConfiguration->fixedTiming = 18.5f; });
+		efitick_t runningFrom = 0;
+		for (size_t k = 0; k < stateAt.size() && k < t.teeth.size(); k++) {
+			if (stateAt[k] == RUNNING) {
+				runningFrom = t.teeth[k].nt;
+				break;
+			}
+		}
+		if (runningFrom == 0) {
+			continue; // the missed tooth cost the sync before the switch: nothing to check
+		}
+		reachedRunning++;
+		int level = 0;
+		for (const Coil& c : t.coils) {
+			if (c.charge) {
+				EXPECT_EQ(0, level) << "a charge started while the shared coil was still charged, miss " << miss;
+				level = 1;
+			} else {
+				level = 0;
+			}
+		}
+		for (const Spark& s : analyze(t)) {
+			if (s.dwellMs < 0 || NT2US((double)runningFrom) > s.tUs - s.dwellMs * 1000.0) {
+				continue; // charged while CRANKING: its 40 ms backup is by design
+			}
+			runningEdgeCharges += s.edge;
+			if (s.edge) {
+				EXPECT_LE(s.dwellMs, 3 * 4.5 + 0.2) << "edge charge scheduled while RUNNING, miss " << miss;
+			}
+		}
+		Integrity i = integrity(t);
+		EXPECT_EQ(0, i.doubleCharge + i.doubleSpark + i.dangling) << miss;
+	}
+	printf("edge charges scheduled while RUNNING across 50 missed-tooth positions: %d (%d runs reached RUNNING)\n", runningEdgeCharges, reachedRunning);
+	EXPECT_GT(runningEdgeCharges, 0) << "no edge-owned charge was scheduled while RUNNING: the test does not reach the rule";
+}
+
