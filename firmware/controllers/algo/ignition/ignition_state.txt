@@ -20,6 +20,7 @@ struct_no_prefix ignition_state_s
 	bit luaIgnitionSkip;Lua Spark Skip
 	bit crankSparkToothLocked;Spark tooth-locked
 	bit crankSparkNotLockable;Spark not lockable
+	bit crankSparkLate;Spark late (tooth-lock)
 
 	int16_t autoscale trailingSparkAngle;Trailing spark deg;"deg",{1/@@PACK_MULT_PERCENT@@},0, -20,20, 2,@@GAUGE_CATEGORY_TIMING@@
 	int16_t rpmForIgnitionTableDot;

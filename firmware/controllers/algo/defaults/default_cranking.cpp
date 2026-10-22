@@ -12,6 +12,7 @@ void setDefaultCranking() {
 	// Ignition
 	engineConfiguration->ignitionDwellForCrankingMs = DEFAULT_CRANKING_DWELL_MS;
 	engineConfiguration->crankingTimingAngle = DEFAULT_CRANKING_ANGLE;
+	engineConfiguration->crankingToothLateSparkMaxDeg = 15;
 
 	// IAC
 	setArrayValues(config->cltCrankingCorr, 50);
