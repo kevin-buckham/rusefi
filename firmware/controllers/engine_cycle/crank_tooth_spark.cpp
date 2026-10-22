@@ -157,10 +157,9 @@ float crankToothChargeDelayUs(float remainingDeg, float dwellMs, float predicted
 	return std::max(delay, 0.0f);
 }
 
-// a spark is tooth-locked only if its tooth is at most this many degrees after the commanded advance
-static constexpr float reachDeg = 5;
-// while cranking, a coil whose spark tooth never arrives is held at least this long before it is released
-static constexpr float overDwellLimitMs = 40;
+// a setting of 0 is what a tune saved before the setting existed reads as
+static constexpr float defaultMaxRetardDeg = 5;
+static constexpr float defaultBackupDwellMs = 40;
 
 float crankToothLateDwellMs(float dwellMs, float lastUsPerDeg, float maxDeg) {
 	const float ms = std::max(1.5f, 0.5f * dwellMs);
@@ -253,10 +252,11 @@ bool CrankToothSpark::isAllowed() const {
 
 CrankToothPlan CrankToothSpark::plan(const IgnitionEvent& event) const {
 	const TriggerCentral& tc = engine->triggerCentral;
+	const float configured = engineConfiguration->crankingToothLockMaxRetardDeg;
 	return planCrankToothEvent(tc.triggerFormDetails.eventAngles, tc.engineCycleEventCount, tdcPosition(),
 		engine->engineState.engineCycle, event.sparkAngle, event.dwellAngle,
 		getPerCylinderFiringOrderOffset(event.cylinderIndex, event.coilIndex),
-		reachDeg);
+		configured == 0 ? defaultMaxRetardDeg : clampF(0, configured, 20));
 }
 
 bool CrankToothSpark::isChargeUsable(float currentPhase, float sparkPhase, floatms_t dwellMs) const {
@@ -280,7 +280,9 @@ efitick_t CrankToothSpark::chargeTime(efitick_t edgeTimestamp, float currentPhas
 }
 
 floatms_t CrankToothSpark::overDwellMs(floatms_t dwellMs) const {
-	return crankToothBackupMs(dwellMs, engine->rpmCalculator.getState() == CRANKING, overDwellLimitMs);
+	const float configured = engineConfiguration->crankingToothLockBackupDwellMs;
+	return crankToothBackupMs(dwellMs, engine->rpmCalculator.getState() == CRANKING,
+		configured == 0 ? defaultBackupDwellMs : clampF(10, configured, 100));
 }
 
 floatms_t CrankToothSpark::lateDwellMs(floatms_t dwellMs) const {

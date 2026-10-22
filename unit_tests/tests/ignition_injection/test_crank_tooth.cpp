@@ -724,44 +724,74 @@ TEST(crankTooth, geometryFollowsLayout) {
 
 // the coil stays charged until the backup releases it when the crank stops before the spark tooth
 TEST(crankTooth, overDwellBackup) {
-	double longest = 0;
-	for (size_t stopAfter = 72; stopAfter < 96; stopAfter++) {
-		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
-		setUpCrank(eth, true);
-		Capture run;
-		play(eth, run, steady(210, stopAfter));
-		eth.moveTimeForwardAndInvokeEventsUs(300000);
-		for (const Spark& s : sparksAfter(run, 30)) {
-			longest = std::max(longest, s.dwellMs);
+	// 0 reads as the default, 40
+	for (double limitMs : {0.0, 10.0, 20.0, 40.0}) {
+		double longest = 0;
+		for (size_t stopAfter = 72; stopAfter < 96; stopAfter++) {
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			setUpCrank(eth, true);
+			engineConfiguration->crankingToothLockBackupDwellMs = limitMs;
+			Capture run;
+			play(eth, run, steady(210, stopAfter));
+			eth.moveTimeForwardAndInvokeEventsUs(300000);
+			for (const Spark& s : sparksAfter(run, 30)) {
+				longest = std::max(longest, s.dwellMs);
+			}
 		}
+		// while cranking: the larger of the limit and 3 x the 4.5 ms dwell
+		EXPECT_NEAR(std::max(limitMs == 0 ? 40.0 : limitMs, 13.5), longest, 0.3) << limitMs;
 	}
-	// while cranking: the larger of 40 ms and 3 x the 4.5 ms dwell
-	EXPECT_NEAR(40, longest, 0.3);
 }
 
-// a charge carried over the switch to RUNNING is released by the shorter of 40 ms and 3 x dwell
+// a charge carried over the switch to RUNNING is released by the shorter of the limit and 3 x dwell
 TEST(crankTooth, overDwellBackupRunning) {
-	auto setUp = [](EngineTestHelper& eth) {
-		setUpCrank(eth, true, 222);
-		setUpWideCommand();
-	};
-	Capture probe;
-	{
+	for (double limitMs : {40.0, 100.0}) {
+		auto setUp = [=](EngineTestHelper& eth) {
+			setUpCrank(eth, true, 222);
+			setUpWideCommand();
+			engineConfiguration->crankingToothLockBackupDwellMs = limitMs;
+		};
+		Capture probe;
+		{
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			setUp(eth);
+			play(eth, probe, flash());
+		}
+		ASSERT_GT(probe.runningLockedAt, 0);
+
+		// the same run, stopped right after that charge was scheduled
 		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
 		setUp(eth);
-		play(eth, probe, flash());
+		std::vector<double> rpm = flash();
+		rpm.resize(probe.runningLockedAt + 1);
+		Capture run;
+		play(eth, run, rpm);
+		eth.moveTimeForwardAndInvokeEventsUs(300000);
+		EXPECT_NEAR(27, sparksAfter(run, 30).back().dwellMs, 0.5) << limitMs;
 	}
-	ASSERT_GT(probe.runningLockedAt, 0);
+}
 
-	// the same run, stopped right after that charge was scheduled
-	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
-	setUp(eth);
-	std::vector<double> rpm = flash();
-	rpm.resize(probe.runningLockedAt + 1);
-	Capture run;
-	play(eth, run, rpm);
-	eth.moveTimeForwardAndInvokeEventsUs(300000);
-	EXPECT_NEAR(27, sparksAfter(run, 30).back().dwellMs, 0.5);
+// a command farther before its tooth than the reach setting keeps normal scheduling; 0 reads as the default, 5
+TEST(crankTooth, maxRetardSetting) {
+	for (int reach : {0, 5, 19, 20}) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		setUpCrank(eth, true);
+		// 20 degrees before the 12 BTDC tooth
+		engineConfiguration->fixedTiming = 32;
+		engineConfiguration->crankingToothLockMaxRetardDeg = reach;
+		bool locked = false;
+		bool notLockable = false;
+		Capture run;
+		play(eth, run, steady(210, 100), [&](size_t) {
+			locked |= engine->ignitionState.crankSparkToothLocked;
+			notLockable |= engine->ignitionState.crankSparkNotLockable;
+		});
+		EXPECT_EQ(reach == 20, locked) << reach;
+		EXPECT_EQ(reach != 20, notLockable) << reach;
+		for (const Spark& s : sparksAfter(run, 60)) {
+			EXPECT_NEAR(reach == 20 ? 20.0 : 0.0, s.errDeg, 0.1) << reach;
+		}
+	}
 }
 
 TEST(crankTooth, geometryCheckByWheel) {
