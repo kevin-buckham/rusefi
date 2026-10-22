@@ -13,6 +13,7 @@
 #include "event_queue.h"
 
 #include "knock_logic.h"
+#include "crank_tooth_spark.h"
 
 #if EFI_ENGINE_CONTROL
 
@@ -91,6 +92,8 @@ static void prepareCylinderIgnitionSchedule(angle_t dwellAngleDuration, floatms_
 
 	// let's save planned duration so that we can later compare it with reality
 	event->sparkDwell = sparkDwell;
+	event->crankToothPlan = {};
+	event->crankToothDecided = false;
 
 	auto ignitionMode = getCurrentIgnitionMode();
 
@@ -211,20 +214,38 @@ static void overFireSparkAndPrepareNextSchedule(IgnitionEvent *event) {
 	fireSparkAndPrepareNextSchedule(event);
 }
 
+// A tooth-locked spark that fires with no coil charged (its tooth came before its charge started) is skipped, and the
+// charge planned for it must not start after it: nothing would release that coil until the backup.
+static void skipCrankToothCharge(IgnitionEvent *event) {
+	if (event->crankToothPlan.valid && !event->wasSparkLimited && event->dwellStartTimer.action) {
+		engine->scheduler.cancel(&event->dwellStartTimer);
+	}
+}
+
+static bool anyChargedOutput(const IgnitionEvent *event) {
+	for (auto* output : event->chargedOutputs) {
+		if (output) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /**
  * TL,DR: each IgnitionEvent is in charge of it's own scheduling forever, we plant next event while finishing handling of the current one
  */
 void fireSparkAndPrepareNextSchedule(IgnitionEvent *event) {
+	const bool hasChargedOutput = anyChargedOutput(event);
+
+	if (!hasChargedOutput) {
+		skipCrankToothCharge(event);
+	}
+
 #if EFI_UNIT_TEST
 	if (engine->onIgnitionEvent) {
 		engine->onIgnitionEvent(event, false);
 	}
 #endif
-
-	bool hasChargedOutput = false;
-	for (auto* output : event->chargedOutputs) {
-		hasChargedOutput |= output != nullptr;
-	}
 
 	for (int i = 0; i< MAX_OUTPUTS_FOR_IGNITION;i++) {
 		IgnitionOutputPin *output = hasChargedOutput ? event->chargedOutputs[i] : event->outputs[i];
@@ -401,7 +422,8 @@ void turnSparkPinHighStartCharging(IgnitionEvent *event) {
 
 
 static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
-		float rpm, float dwellMs, float dwellAngle, float sparkAngle, efitick_t edgeTimestamp, float currentPhase, float nextPhase) {
+		float rpm, float dwellMs, float dwellAngle, float sparkAngle, efitick_t edgeTimestamp, float currentPhase,
+		float nextPhase, bool toothLocked) {
 	UNUSED(rpm);
 
 	float angleOffset = dwellAngle - currentPhase;
@@ -444,7 +466,15 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 		 * This way we make sure that coil dwell started while spark was enabled would fire and not burn
 		 * the coil.
 		 */
-		chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset, action_s::make<turnSparkPinHighStartCharging>( event ));
+		if (toothLocked) {
+			chargeTime = engine->module<CrankToothSpark>()->chargeTime(edgeTimestamp, currentPhase, sparkAngle, dwellMs);
+			// a charge still pending on this timer makes the insert fail, so a second charge cannot stack
+			engine->scheduler.schedule("dwell", &event->dwellStartTimer, chargeTime,
+				action_s::make<turnSparkPinHighStartCharging>( event ));
+		} else {
+			chargeTime = scheduleByAngle(&event->dwellStartTimer, edgeTimestamp, angleOffset,
+				action_s::make<turnSparkPinHighStartCharging>( event ));
+		}
 
 #if EFI_UNIT_TEST
 		engine->onScheduleTurnSparkPinHighStartCharging(*event, edgeTimestamp, angleOffset, chargeTime);
@@ -499,8 +529,12 @@ static void scheduleSparkEvent(bool limitedSpark, IgnitionEvent *event,
 	} else {
 		// event was queued in relation to some expected tooth event in the future which might just never come so we shall protect from over-dwell
 		if (!limitedSpark) {
-			// auto fire spark at 1.5x nominal dwell
-			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(1.5f * dwellMs));
+			// auto fire spark at 1.5x nominal dwell, tooth-locked events wait longer
+			float overdwellMs = 1.5f * dwellMs;
+			if (toothLocked) {
+				overdwellMs = engine->module<CrankToothSpark>()->overDwellMs(dwellMs);
+			}
+			efitick_t fireTime = sumTickAndFloat(chargeTime, MSF2NT(overdwellMs));
 
 #if SPARK_EXTREME_LOGGING
 			efitimeus_t fireTimeUs = NT2US(fireTime);
@@ -616,6 +650,14 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 		engine->engineState.useOddFireWastedSpark
 		&& getCurrentIgnitionMode() == IM_WASTED_SPARK;
 
+	auto& crankTooth = *engine->module<CrankToothSpark>();
+	const bool crankToothSetting = engineConfiguration->crankingToothLockedSpark;
+	const bool crankToothAllowed = crankTooth.isAllowed();
+	if (!crankToothSetting) {
+		engine->ignitionState.crankSparkToothLocked = false;
+		engine->ignitionState.crankSparkNotLockable = false;
+	}
+
 	if (engine->ignitionEvents.isReady) {
 		for (size_t i = 0; i < engineConfiguration->cylindersCount; i++) {
 			IgnitionEvent *event = &engine->ignitionEvents.elements[i];
@@ -626,6 +668,17 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 			if (std::isnan(sparkAngle)) {
 				warning(ObdCode::CUSTOM_ADVANCE_SPARK, "NaN advance");
 				continue;
+			}
+
+			// decided once per spark, on the first tooth the mode allows it; the event keeps that path until it fires
+			if (!event->crankToothDecided && crankToothAllowed) {
+				event->crankToothPlan = crankTooth.plan(*event);
+				event->crankToothDecided = true;
+			}
+			const bool toothLocked = event->crankToothPlan.valid;
+			if (toothLocked) {
+				dwellAngle = event->crankToothPlan.dwellPhase;
+				sparkAngle = event->crankToothPlan.sparkPhase;
 			}
 
 			bool isOddCylWastedEvent = false;
@@ -650,6 +703,15 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 			}
 
 			if (!isOddCylWastedEvent && !isPhaseInRange(dwellAngle, currentPhase, nextPhase)) {
+				continue;
+			}
+			if (toothLocked && !crankTooth.isChargeUsable(currentPhase, sparkAngle, event->sparkDwell)) {
+				// no interval since the window was reset: the stored RPM would start the charge too early,
+				// so this spark is skipped, which is the safe direction. Nothing is scheduled, so the event
+				// may decide again (with the setting off it must take the normal path, not wait for a window
+				// that is no longer fed).
+				event->crankToothPlan = {};
+				event->crankToothDecided = false;
 				continue;
 			}
 
@@ -692,9 +754,15 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 */
 #endif // EFI_ANTILAG_SYSTEM
 
+			engine->ignitionState.crankSparkToothLocked = toothLocked && crankToothSetting;
+			engine->ignitionState.crankSparkNotLockable = !toothLocked && crankToothAllowed;
+			// latches the normal path for a spark decided while the mode was not allowed
+			event->crankToothDecided = true;
+
 			// The watchdog must use the dwell saved with these angles. Global dwell
 			// may have changed since this cylinder's pending plan was prepared.
-			scheduleSparkEvent(limitedSpark, event, rpm, event->sparkDwell, dwellAngle, sparkAngle, edgeTimestamp, currentPhase, nextPhase);
+			scheduleSparkEvent(limitedSpark, event, rpm, event->sparkDwell, dwellAngle, sparkAngle, edgeTimestamp,
+				currentPhase, nextPhase, toothLocked);
 		}
 	}
 }

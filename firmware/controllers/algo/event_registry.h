@@ -12,6 +12,7 @@
 #include "scheduler.h"
 #include "fl_stack.h"
 #include "trigger_structure.h"
+#include "crank_tooth_plan.h"
 
 struct AngleBasedEvent {
 	scheduling_s eventScheduling;
@@ -81,6 +82,10 @@ public:
 	Timer actualDwellTimer;
 
 	float dwellAngle = 0;
+
+	// crankingToothLockedSpark: decided once after the angles are latched, kept until the event fires
+	CrankToothPlan crankToothPlan;
+	bool crankToothDecided = false;
 
 	/**
 	 * Sequential number of currently processed spark event

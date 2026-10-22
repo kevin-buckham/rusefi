@@ -151,6 +151,9 @@ angle_t TriggerCentral::syncEnginePhaseAndReport(int divider, int remainder) {
 		int indexOffset = (newSyncCounter - oldSyncCounter) * triggerShape.getSize();
 
 		instantRpm.offsetIndices(indexOffset);
+#if EFI_ENGINE_CONTROL
+		engine->module<CrankToothSpark>()->resetFromTrigger();
+#endif // EFI_ENGINE_CONTROL
 
 		// Adjust phase-dependent variables
 		if (expectedNextPhase) {

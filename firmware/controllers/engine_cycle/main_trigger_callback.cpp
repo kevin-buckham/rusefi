@@ -233,6 +233,10 @@ void mainTriggerCallback(uint32_t trgEventIndex, efitick_t edgeTimestamp, angle_
 		return;
 	}
 
+	// Before the rpm == 0 return below, which holds for the first cycle after sync: the first sparks of a start are
+	// timed from these teeth.
+	engine->module<CrankToothSpark>()->onTooth(edgeTimestamp, currentPhase);
+
 	float rpm = engine->rpmCalculator.getCachedRpm();
 	if (rpm == 0) {
 		// this happens while we just start cranking

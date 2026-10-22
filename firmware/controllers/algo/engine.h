@@ -44,6 +44,7 @@
 #include "type_list.h"
 #include "boost_control.h"
 #include "ignition_controller.h"
+#include "crank_tooth_spark.h"
 #include "alternator_controller.h"
 #include "harley_acr.h"
 #include "dfco.h"
@@ -213,6 +214,9 @@ public:
 #if EFI_MISFIRE_DETECTION
         Mockable<MisfireController>,
 #endif // EFI_MISFIRE_DETECTION
+#if EFI_ENGINE_CONTROL
+        CrankToothSpark,
+#endif // EFI_ENGINE_CONTROL
 
 #include "modules_list_generated.h"
 		BurstKnock,

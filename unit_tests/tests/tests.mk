@@ -18,6 +18,7 @@ TESTS_SRC_CPP = \
 	tests/ltft_sandbox.cpp \
 	tests/log_replay_sandbox.cpp \
 	tests/trigger/test_all_triggers.cpp \
+	tests/trigger/test_tooth_period_window.cpp \
 	tests/trigger/test_trigger_sequence_finder.cpp \
 	tests/trigger/test_2_stroke.cpp \
 	tests/trigger/test_symmetrical_crank.cpp \
@@ -78,6 +79,8 @@ TESTS_SRC_CPP = \
 	tests/ignition_injection/test_startOfCrankingPrimingPulse.cpp \
 	tests/ignition_injection/test_multispark.cpp \
 	tests/ignition_injection/test_kickstart.cpp \
+	tests/ignition_injection/test_crank_tooth.cpp \
+	tests/ignition_injection/test_crank_tooth_math.cpp \
 	tests/ignition_injection/test_cranking_ripple.cpp \
 	tests/ignition_injection/test_hd_cranking.cpp \
 	tests/ignition_injection/test_hd_cranking2.cpp \
