@@ -71,16 +71,18 @@ is only refreshed once per cycle. It is meant for sparse wheels such as a
 
 The spark tooth is the first tooth at or after the commanded spark, so the
 spark is never earlier than commanded. It is used when that tooth is BTDC and
-at most 5 degrees after the command; other events keep normal scheduling
-(`crankSparkNotLockable`). The path is decided once per spark, on the first
-tooth the mode allows, and kept until the spark fires. The charge start is
-predicted from `ToothPeriodWindow` tooth intervals. If the coil has not
-started charging when the spark tooth arrives, it charges then and fires up to
-`crankingToothLateSparkMaxDeg` degrees late (default 15; 0 skips the spark, use
-it with a mechanical rotor distributor), shown by `Ign: Spark late (tooth-lock)`.
+at most `crankingToothLockMaxRetardDeg` (default 5) after the command; other
+events keep normal scheduling (`crankSparkNotLockable`). The path is decided
+once per spark, on the first tooth the mode allows, and kept until the spark
+fires. The charge start is predicted from `ToothPeriodWindow` tooth intervals.
+If the coil has not started charging when the spark tooth arrives, it charges
+then and fires up to `crankingToothLateSparkMaxDeg` degrees late (default 15;
+0 skips the spark, use it with a mechanical rotor distributor), shown by
+`Ign: Spark late (tooth-lock)`.
 If the releasing tooth never arrives, the coil is released after the larger of
-3 x dwell and 40 ms while cranking (the smaller once RUNNING), which can be
-earlier than commanded.
+3 x dwell and `crankingToothLockBackupDwellMs` (default 40 ms) while cranking
+(the smaller once RUNNING), which can be earlier than commanded. A setting of 0
+means the default, as in a tune saved before the settings existed.
 
 The wheel needs rising edges only and a tooth exactly one stroke after every
 tooth, with 3 to 60 teeth per stroke, on a four stroke engine with even
