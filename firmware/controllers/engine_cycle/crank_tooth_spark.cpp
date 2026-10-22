@@ -162,6 +162,11 @@ static constexpr float reachDeg = 5;
 // while cranking, a coil whose spark tooth never arrives is held at least this long before it is released
 static constexpr float overDwellLimitMs = 40;
 
+float crankToothLateDwellMs(float dwellMs, float lastUsPerDeg, float maxDeg) {
+	const float ms = std::max(1.5f, 0.5f * dwellMs);
+	return (maxDeg > 0 && lastUsPerDeg > 0 && ms * 1000 <= maxDeg * lastUsPerDeg) ? ms : 0;
+}
+
 void CrankToothSpark::onTooth(efitick_t edgeTimestamp, angle_t currentPhase) {
 	const bool enabled = engineConfiguration->crankingToothLockedSpark;
 	if (enabled && !m_settingWasOn) {
@@ -276,6 +281,10 @@ efitick_t CrankToothSpark::chargeTime(efitick_t edgeTimestamp, float currentPhas
 
 floatms_t CrankToothSpark::overDwellMs(floatms_t dwellMs) const {
 	return crankToothBackupMs(dwellMs, engine->rpmCalculator.getState() == CRANKING, overDwellLimitMs);
+}
+
+floatms_t CrankToothSpark::lateDwellMs(floatms_t dwellMs) const {
+	return crankToothLateDwellMs(dwellMs, m_window.lastUsPerDeg(), engineConfiguration->crankingToothLateSparkMaxDeg);
 }
 
 #endif // EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT

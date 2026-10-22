@@ -152,6 +152,21 @@ TEST(crankToothMath, dwellDelayTiers) {
 	EXPECT_FALSE(isCrankToothChargeUsable(NAN, 4.5f, 700));
 }
 
+TEST(crankToothMath, lateDwell) {
+	// half the dwell, at least 1.5 ms
+	EXPECT_NEAR(2.25f, crankToothLateDwellMs(4.5f, 725, 15), 1e-4);
+	EXPECT_NEAR(1.5f, crankToothLateDwellMs(2, 725, 15), 1e-4);
+	// 2.25 ms is 15 degrees at 150 us per degree (1000 rpm): no later spark than that
+	EXPECT_NEAR(2.25f, crankToothLateDwellMs(4.5f, 150, 15), 1e-4);
+	EXPECT_EQ(0, crankToothLateDwellMs(4.5f, 140, 15));
+	// no tooth interval
+	EXPECT_EQ(0, crankToothLateDwellMs(4.5f, 0, 15));
+	// a smaller limit refuses sooner, 0 is off
+	EXPECT_NEAR(2.25f, crankToothLateDwellMs(4.5f, 725, 4), 1e-4);
+	EXPECT_EQ(0, crankToothLateDwellMs(4.5f, 725, 3));
+	EXPECT_EQ(0, crankToothLateDwellMs(4.5f, 725, 0));
+}
+
 TEST(crankToothMath, backupMs) {
 	EXPECT_EQ(40, crankToothBackupMs(4.5f, true, 40));
 	EXPECT_EQ(60, crankToothBackupMs(20, true, 40));

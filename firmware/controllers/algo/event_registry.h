@@ -86,6 +86,8 @@ public:
 	// crankingToothLockedSpark: decided once after the angles are latched, kept until the event fires
 	CrankToothPlan crankToothPlan;
 	bool crankToothDecided = false;
+	// the late-charge fallback was already tried for this spark: it is one shot per spark
+	bool crankToothLateTried = false;
 
 	/**
 	 * Sequential number of currently processed spark event

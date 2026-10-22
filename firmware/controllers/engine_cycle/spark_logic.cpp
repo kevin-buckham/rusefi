@@ -94,6 +94,7 @@ static void prepareCylinderIgnitionSchedule(angle_t dwellAngleDuration, floatms_
 	event->sparkDwell = sparkDwell;
 	event->crankToothPlan = {};
 	event->crankToothDecided = false;
+	event->crankToothLateTried = false;
 
 	auto ignitionMode = getCurrentIgnitionMode();
 
@@ -214,14 +215,6 @@ static void overFireSparkAndPrepareNextSchedule(IgnitionEvent *event) {
 	fireSparkAndPrepareNextSchedule(event);
 }
 
-// A tooth-locked spark that fires with no coil charged (its tooth came before its charge started) is skipped, and the
-// charge planned for it must not start after it: nothing would release that coil until the backup.
-static void skipCrankToothCharge(IgnitionEvent *event) {
-	if (event->crankToothPlan.valid && !event->wasSparkLimited && event->dwellStartTimer.action) {
-		engine->scheduler.cancel(&event->dwellStartTimer);
-	}
-}
-
 static bool anyChargedOutput(const IgnitionEvent *event) {
 	for (auto* output : event->chargedOutputs) {
 		if (output) {
@@ -232,13 +225,46 @@ static bool anyChargedOutput(const IgnitionEvent *event) {
 }
 
 /**
+ * A tooth-locked spark whose tooth arrived before its charge started (the crank sped up after the speed the charge was
+ * timed from) is charged now and fired after a short dwell, a few degrees late, instead of skipped. One shot per
+ * spark. When the late dwell is beyond the limit, or the charge bails, the spark is skipped and the planned charge
+ * cancelled.
+ * @return true when the coil is charging and its fire is scheduled
+ */
+static bool startLateCrankToothSpark(IgnitionEvent *event) {
+	// the charge is still pending on its timer, which a cancel clears (the moment it was due stays, so it is no test)
+	if (!event->crankToothPlan.valid || event->wasSparkLimited || !event->dwellStartTimer.action) {
+		return false;
+	}
+	engine->scheduler.cancel(&event->dwellStartTimer);
+	if (event->crankToothLateTried) {
+		return false;
+	}
+	event->crankToothLateTried = true;
+
+	floatms_t lateMs = engine->module<CrankToothSpark>()->lateDwellMs(event->sparkDwell);
+	if (lateMs <= 0) {
+		return false;
+	}
+	turnSparkPinHighStartCharging(event);
+	if (!anyChargedOutput(event)) {
+		// out of order: skipped, and the caller goes on to the next cycle at once
+		return false;
+	}
+	engine->scheduler.schedule("firing", &event->sparkEvent.eventScheduling,
+		sumTickAndFloat(getTimeNowNt(), MSF2NT(lateMs)), action_s::make<fireSparkAndPrepareNextSchedule>( event ));
+	engine->ignitionState.crankSparkLate = true;
+	return true;
+}
+
+/**
  * TL,DR: each IgnitionEvent is in charge of it's own scheduling forever, we plant next event while finishing handling of the current one
  */
 void fireSparkAndPrepareNextSchedule(IgnitionEvent *event) {
 	const bool hasChargedOutput = anyChargedOutput(event);
 
-	if (!hasChargedOutput) {
-		skipCrankToothCharge(event);
+	if (!hasChargedOutput && startLateCrankToothSpark(event)) {
+		return;
 	}
 
 #if EFI_UNIT_TEST
@@ -656,6 +682,7 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 	if (!crankToothSetting) {
 		engine->ignitionState.crankSparkToothLocked = false;
 		engine->ignitionState.crankSparkNotLockable = false;
+		engine->ignitionState.crankSparkLate = false;
 	}
 
 	if (engine->ignitionEvents.isReady) {
@@ -756,6 +783,8 @@ void onTriggerEventSparkLogic(float rpm, efitick_t edgeTimestamp, float currentP
 
 			engine->ignitionState.crankSparkToothLocked = toothLocked && crankToothSetting;
 			engine->ignitionState.crankSparkNotLockable = !toothLocked && crankToothAllowed;
+			// raised by the late path when it fires this spark
+			engine->ignitionState.crankSparkLate = false;
 			// latches the normal path for a spark decided while the mode was not allowed
 			event->crankToothDecided = true;
 

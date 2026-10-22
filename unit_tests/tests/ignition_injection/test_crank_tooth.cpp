@@ -205,6 +205,26 @@ int chargesOf(const Capture& run, uint32_t counter) {
 	return charges;
 }
 
+// the tooth at which a late (short dwell) charge was made, or -1
+int lateTooth(const Capture& run, uint32_t& counter) {
+	for (const Edge& charge : run.edges) {
+		if (!charge.charge) {
+			continue;
+		}
+		for (const Edge& spark : run.edges) {
+			if (!spark.charge && spark.counter == charge.counter && NT2US((double)(spark.nt - charge.nt)) < 3000) {
+				for (size_t k = 0; k < run.teeth.size(); k++) {
+					if (run.teeth[k].nt == charge.nt) {
+						counter = charge.counter;
+						return (int)k;
+					}
+				}
+			}
+		}
+	}
+	return -1;
+}
+
 // the trigger stops: everything in flight runs out, and no coil may be left charging
 void expectSettled(EngineTestHelper& eth, const char* what) {
 	eth.moveTimeForwardAndInvokeEventsUs(1000000);
@@ -212,6 +232,22 @@ void expectSettled(EngineTestHelper& eth, const char* what) {
 	for (const IgnitionEvent& e : getIgnitionEvents()->elements) {
 		EXPECT_FALSE(e.chargedOutputs[0]) << what;
 	}
+}
+
+// first slow-tooth position whose recovery makes a late charge: its slow-tooth index, the tooth the late charge is
+// made at (time moves on to the next tooth with its events, so it is made after before(k + 1)) and its spark counter
+bool findLate(size_t& n, int& k, uint32_t& counter) {
+	for (n = 60; n < 72; n++) {
+		Capture probe;
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		setUpCrank(eth, true);
+		play(eth, probe, slowThenRecover(n));
+		k = lateTooth(probe, counter);
+		if (k >= 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace
@@ -316,12 +352,44 @@ TEST(crankTooth, noToothInReachUsesNormalPath) {
 }
 
 // the speed recovers after one slow tooth, so the spark tooth comes before the charge the slow twin put off: the
-// spark is skipped, never fired early, the planned charge does not start after it, and the next cycle goes on as usual
-TEST(crankTooth, toothBeforeChargeSkipsSparkCleanly) {
+// spark is late, not skipped, never early, and its charge is the short late dwell
+TEST(crankTooth, lateNotLost) {
+	size_t lateSparks = 0;
+	for (size_t n = 60; n < 72; n++) {
+		Capture on, off;
+		{
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			setUpCrank(eth, true);
+			play(eth, on, slowThenRecover(n));
+		}
+		{
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			setUpCrank(eth, false);
+			play(eth, off, slowThenRecover(n));
+		}
+		EXPECT_EQ(0, on.outOfOrder) << n;
+		EXPECT_TRUE(chargesAndSparksPair(on)) << n;
+		auto sparks = sparksAfter(on, 50);
+		EXPECT_GE(sparks.size(), sparksAfter(off, 50).size() - 1) << n;
+		for (const Spark& s : sparks) {
+			EXPECT_GT(s.errDeg, -0.1) << n;
+			EXPECT_LT(s.errDeg, 15.0) << n;
+			EXPECT_LT(s.dwellMs, 40.0) << n;
+			lateSparks += s.dwellMs < 3.0;
+		}
+	}
+	EXPECT_GT(lateSparks, 0u);
+}
+
+// The late spark is refused or off: the spark whose tooth came before its charge is skipped, never fired early, the
+// planned charge does not start after it, and the next cycle goes on as usual.
+void expectSkipsCleanly(uint8_t lateLimit, float dwellMs) {
 	size_t skippedSparks = 0;
 	for (size_t n = 60; n < 72; n++) {
 		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
 		setUpCrank(eth, true);
+		engineConfiguration->crankingToothLateSparkMaxDeg = lateLimit;
+		engineConfiguration->ignitionDwellForCrankingMs = dwellMs;
 		Capture run;
 		play(eth, run, slowThenRecover(n));
 		std::set<uint32_t> skipped;
@@ -334,6 +402,7 @@ TEST(crankTooth, toothBeforeChargeSkipsSparkCleanly) {
 		for (uint32_t counter : skipped) {
 			EXPECT_EQ(1, sparksOf(run, counter)) << n;
 		}
+		EXPECT_FALSE(engine->ignitionState.crankSparkLate) << n;
 		EXPECT_GE(sparksAfter(run, n + 2).size(), 2u) << n;
 		for (const Spark& s : sparksAfter(run, 50)) {
 			EXPECT_GT(s.errDeg, -0.1) << n;
@@ -346,7 +415,176 @@ TEST(crankTooth, toothBeforeChargeSkipsSparkCleanly) {
 		EXPECT_EQ(0, engine->engineState.sparkOutOfOrderCounter) << n;
 		expectSettled(eth, "skipped");
 	}
-	EXPECT_GT(skippedSparks, 0u);
+	EXPECT_GT(skippedSparks, 0u) << (int)lateLimit << " " << dwellMs;
+}
+
+TEST(crankTooth, toothBeforeChargeSkipsSparkCleanly) {
+	// off
+	expectSkipsCleanly(0, 4.5f);
+	// 2 degrees at 230 rpm is 1.45 ms, less than the shortest late dwell
+	expectSkipsCleanly(2, 4.5f);
+	// the late dwell of a 26 ms dwell is 13 ms, more than 15 degrees at 230 rpm
+	expectSkipsCleanly(15, 26);
+}
+
+// a late charge that bails (a later spark already fired on the coil) is skipped at once: no second attempt, no repeated
+// rescheduling of the fire, and the next cycle prepares as usual
+TEST(crankTooth, lateBailIsOneShot) {
+	size_t n;
+	int k;
+	uint32_t counter;
+	ASSERT_TRUE(findLate(n, k, counter));
+
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	setUpCrank(eth, true);
+	Capture run;
+	IgnitionOutputPin& coil = enginePins.coils[0];
+	uint32_t saved = 0;
+	// the late charge is made while time moves to the next tooth, after before(k + 1)
+	play(eth, run, slowThenRecover(n), [&](size_t t) {
+		if ((int)t == k + 1) {
+			saved = coil.signalFallSparkId;
+			coil.signalFallSparkId = UINT32_MAX;
+		} else if ((int)t == k + 2) {
+			coil.signalFallSparkId = saved;
+		}
+	});
+	// the bailed spark is the only one lost: one out-of-order, one spark edge without a charge, no repeats
+	EXPECT_EQ(1, run.outOfOrder);
+	EXPECT_EQ(0, chargesOf(run, counter));
+	EXPECT_EQ(1, sparksOf(run, counter));
+	for (const Edge& e : run.edges) {
+		EXPECT_EQ(1, sparksOf(run, e.counter));
+		EXPECT_LE(chargesOf(run, e.counter), 1);
+	}
+	EXPECT_GE(sparksAfter(run, k + 2).size(), 3u);
+	expectSettled(eth, "bail");
+	EXPECT_EQ(1, engine->engineState.sparkOutOfOrderCounter);
+}
+
+// a trigger error or an engine stop right as a late charge starts: its fire is time scheduled, so the coil is released
+// once, and nothing is left charging
+TEST(crankTooth, lateTriggerErrorDuringDwell) {
+	size_t n;
+	int k;
+	uint32_t counter;
+	ASSERT_TRUE(findLate(n, k, counter));
+	for (int what = 0; what < 2; what++) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		setUpCrank(eth, true);
+		Capture run;
+		bool injected = false;
+		play(eth, run, slowThenRecover(n), nullptr, [&](IgnitionEvent* e, bool charge) {
+			if (charge && e->sparkCounter == counter) {
+				EXPECT_TRUE(enginePins.coils[0].getLogicValue());
+				injected = true;
+				if (what == 0) {
+					engine->triggerCentral.triggerState.onTriggerError();
+				} else {
+					engine->rpmCalculator.setStopSpinning();
+				}
+			}
+		});
+		ASSERT_TRUE(injected);
+		EXPECT_EQ(1, chargesOf(run, counter)) << what;
+		EXPECT_EQ(1, sparksOf(run, counter)) << what;
+		EXPECT_EQ(0, run.outOfOrder) << what;
+		for (const Edge& e : run.edges) {
+			EXPECT_LE(chargesOf(run, e.counter), 1) << what;
+			EXPECT_LE(sparksOf(run, e.counter), 1) << what;
+		}
+		expectSettled(eth, what ? "stop" : "error");
+	}
+}
+
+// the late spark limit is a setting: with 0 (off) or a limit the late dwell exceeds there is no late spark, and the
+// live bit follows the late sparks
+TEST(crankTooth, lateSparkLimitSetting) {
+	struct Result {
+		size_t lateSparks = 0;
+		bool bit = false;
+	};
+	// limit < 0 leaves the default
+	auto run = [](int limit, bool toothLocked) {
+		Result r;
+		for (size_t n = 60; n < 72; n++) {
+			EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+			setUpCrank(eth, toothLocked);
+			if (limit >= 0) {
+				engineConfiguration->crankingToothLateSparkMaxDeg = limit;
+			}
+			Capture c;
+			play(eth, c, slowThenRecover(n), [&](size_t) {
+				r.bit |= engine->ignitionState.crankSparkLate;
+			});
+			for (const Edge& e : c.edges) {
+				for (const Edge& ch : c.edges) {
+					r.lateSparks += !e.charge && ch.charge && ch.counter == e.counter
+						&& NT2US((double)(e.nt - ch.nt)) < 3000;
+				}
+			}
+		}
+		return r;
+	};
+	Result def = run(-1, true);
+	EXPECT_GT(def.lateSparks, 0u);
+	EXPECT_TRUE(def.bit);
+	// the default is 15 degrees
+	EXPECT_EQ(def.lateSparks, run(15, true).lateSparks);
+	for (int limit : {0, 2}) {
+		Result r = run(limit, true);
+		EXPECT_EQ(0u, r.lateSparks) << limit;
+		EXPECT_FALSE(r.bit) << limit;
+	}
+	// the setting off: the bit never rises
+	EXPECT_FALSE(run(-1, false).bit);
+}
+
+// the late dwell is judged at the newest tooth interval, and there is none after the window is reset
+TEST(crankTooth, lateDwellFollowsNewestInterval) {
+	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+	setUpCrank(eth, true);
+	auto& module = *engine->module<CrankToothSpark>();
+	Capture slow, fast;
+	play(eth, slow, steady(230, 40));
+	// 15 degrees at 230 rpm is 10.9 ms
+	EXPECT_NEAR(2.25, module.lateDwellMs(4.5f), 1e-3);
+	// 15 degrees at 1200 rpm is 2.1 ms, less than the late dwell
+	play(eth, fast, steady(1200, 3));
+	EXPECT_EQ(0, module.lateDwellMs(4.5f));
+	engine->rpmCalculator.setStopSpinning();
+	EXPECT_EQ(0, module.lateDwellMs(4.5f));
+}
+
+// faster spin-up on, the crank goes 200 -> 900 rpm in a few teeth: nothing early, no tooth-lock while spinning up, and
+// every late spark within its bound
+TEST(crankTooth, lateDuringSpinUp) {
+	for (size_t start : {40u, 55u, 70u}) {
+		EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+		setUpCrank(eth, true);
+		engineConfiguration->isFasterEngineSpinUpEnabled = true;
+		std::vector<double> rpm = steady(200, start);
+		for (double r : {260.0, 340.0, 450.0, 600.0, 750.0}) {
+			rpm.push_back(r);
+		}
+		rpm.resize(rpm.size() + 60, 900);
+		Capture run;
+		play(eth, run, rpm, [&](size_t) {
+			if (engine->rpmCalculator.getState() == SPINNING_UP) {
+				EXPECT_FALSE(engine->ignitionState.crankSparkToothLocked);
+				EXPECT_FALSE(engine->ignitionState.crankSparkLate);
+			}
+		});
+		for (const Spark& s : sparksAfter(run, 10)) {
+			EXPECT_GT(s.errDeg, -0.5) << start;
+			// a late spark is within the 5 degree reach plus the 15 degree late bound
+			if (s.dwellMs >= 0 && s.dwellMs < 3.0) {
+				EXPECT_LT(s.errDeg, 20.0) << start;
+			}
+		}
+		EXPECT_EQ(0, run.outOfOrder) << start;
+		EXPECT_TRUE(chargesAndSparksPair(run)) << start;
+	}
 }
 
 // a flip of the setting applies when an event next decides, so never to a charge already scheduled

@@ -27,6 +27,11 @@ bool isCrankToothWheelUsable(const float* eventAngles, size_t eventCount, float 
 // while cranking, at most backupLimitMs once RUNNING.
 float crankToothBackupMs(float dwellMs, bool cranking, float backupLimitMs);
 
+// Dwell of a spark whose tooth arrived before its charge started: it is charged from the tooth and fired late,
+// instead of skipped. At least 1.5 ms, else half the dwell; 0 when that would be more than maxDeg degrees after the
+// tooth at the newest tooth interval, or there is none, or maxDeg is 0 (off).
+float crankToothLateDwellMs(float dwellMs, float lastUsPerDeg, float maxDeg);
+
 // Is there enough speed information to time a tooth-locked charge: an interval since the window was reset.
 bool isCrankToothChargeUsable(float remainingDeg, float dwellMs, float lastUsPerDeg);
 
@@ -62,6 +67,8 @@ public:
 	efitick_t chargeTime(efitick_t edgeTimestamp, float currentPhase, float sparkPhase, floatms_t dwellMs) const;
 	// Delay from the start of charge to the release of a coil whose spark tooth has not arrived.
 	floatms_t overDwellMs(floatms_t dwellMs) const;
+	// Dwell for a late spark, see crankToothLateDwellMs; 0 when the spark is to be skipped.
+	floatms_t lateDwellMs(floatms_t dwellMs) const;
 
 	const ToothPeriodWindow& window() const {
 		return m_window;
@@ -107,6 +114,9 @@ public:
 	}
 	floatms_t overDwellMs(floatms_t dwellMs) const {
 		return dwellMs;
+	}
+	floatms_t lateDwellMs(floatms_t) const {
+		return 0;
 	}
 };
 
