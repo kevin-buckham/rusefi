@@ -75,9 +75,11 @@ at most 5 degrees after the command; other events keep normal scheduling
 (`crankSparkNotLockable`). The path is decided once per spark, on the first
 tooth the mode allows, and kept until the spark fires. The charge start is
 predicted from `ToothPeriodWindow` tooth intervals. If the coil has not
-started charging when the spark tooth arrives, that spark is skipped. If the
-releasing tooth never arrives, the coil is released after the larger of 3 x
-dwell and 40 ms while cranking (the smaller once RUNNING), which can be
+started charging when the spark tooth arrives, it charges then and fires up to
+`crankingToothLateSparkMaxDeg` degrees late (default 15; 0 skips the spark, use
+it with a mechanical rotor distributor), shown by `Ign: Spark late (tooth-lock)`.
+If the releasing tooth never arrives, the coil is released after the larger of
+3 x dwell and 40 ms while cranking (the smaller once RUNNING), which can be
 earlier than commanded.
 
 The wheel needs rising edges only and a tooth exactly one stroke after every
