@@ -62,6 +62,31 @@ timing bypass and cranking-correction switch. Telemetry is `isBurstKnockActive`,
 `unit_tests/tests/ignition_injection/test_burst_knock.cpp` exercise the detector,
 table, decay and ignition integration.
 
+## Tooth-locked cranking spark
+
+`crankingToothLockedSpark` (default off) fires each spark on a trigger tooth
+while the engine is CRANKING, instead of timing it from the stored RPM, which
+is only refreshed once per cycle. It is meant for sparse wheels such as a
+12 tooth crank, where cranking speed swings widely within a cycle.
+
+The spark tooth is the first tooth at or after the commanded spark, so the
+spark is never earlier than commanded. It is used when that tooth is BTDC and
+at most 5 degrees after the command; other events keep normal scheduling
+(`crankSparkNotLockable`). The path is decided once per spark, on the first
+tooth the mode allows, and kept until the spark fires. The charge start is
+predicted from `ToothPeriodWindow` tooth intervals. If the coil has not
+started charging when the spark tooth arrives, that spark is skipped. If the
+releasing tooth never arrives, the coil is released after the larger of 3 x
+dwell and 40 ms while cranking (the smaller once RUNNING), which can be
+earlier than commanded.
+
+The wheel needs rising edges only and a tooth exactly one stroke after every
+tooth, with 3 to 60 teeth per stroke, on a four stroke engine with even
+firing (`CrankToothSpark::isGeometryValid`); 36-1 does not qualify.
+`CrankToothSpark` is an `EngineModule` (`crank_tooth_spark.cpp`); the tooth
+history is in `tooth_period_window.h`, the scheduling hook in `spark_logic.cpp`,
+tests in `test_crank_tooth*.cpp`.
+
 ## Implementation Notes
 - **BTDC vs ATDC**: Advance is typically measured in degrees Before Top Dead Center (BTDC). Internal math may use 0-720° cycle coordinates.
 - **Dwell Overlap**: rusEFI supports overlapping dwell events (where one coil starts charging before another finishes firing).

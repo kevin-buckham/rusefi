@@ -54,6 +54,7 @@ Release template (copy/paste this for new release):
  - 36-2-2 Suzuki trigger
  - better MLVLG v2 support: logs have embedded tune
  - Nissan VK56DE (36-1-1) crank and PHASE cam triggers
+ - Tooth-locked cranking spark for sparse trigger wheels (crankingToothLockedSpark)
 
 ### Fixed
  - A failed configured A/C pressure sensor no longer re-enables the compressor after a pressure cut.
