@@ -23,6 +23,7 @@ struct_no_prefix trigger_central_s
 	uint8_t triggerIgnoredToothCount
     angle_t mapCamPrevToothAngle;Sync: MAP: prev angle;"deg", 1, 0, -3000, 3000, 2
 	bit isDecodingMapCam
+	bit camEarlyRiseUsed;Sync: phase from early cam rise
 
 	uint32_t triggerElapsedUs
 
