@@ -91,6 +91,11 @@ firing (`CrankToothSpark::isGeometryValid`); 36-1 does not qualify.
 history is in `tooth_period_window.h`, the scheduling hook in `spark_logic.cpp`,
 tests in `test_crank_tooth*.cpp`.
 
+`camEarlyRiseLatch` (default off): with a single tooth cam on a crank speed
+trigger, a cam rise between crank sync and the first RPM is kept as its sync
+counter and gives the phase right after the first RPM (`camEarlyRiseUsed`),
+so phase-required ignition starts a cam revolution sooner (`TriggerCentral`).
+
 ## Implementation Notes
 - **BTDC vs ATDC**: Advance is typically measured in degrees Before Top Dead Center (BTDC). Internal math may use 0-720° cycle coordinates.
 - **Dwell Overlap**: rusEFI supports overlapping dwell events (where one coil starts charging before another finishes firing).

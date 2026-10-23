@@ -55,6 +55,7 @@ Release template (copy/paste this for new release):
  - better MLVLG v2 support: logs have embedded tune
  - Nissan VK56DE (36-1-1) crank and PHASE cam triggers
  - Tooth-locked cranking spark for sparse trigger wheels (crankingToothLockedSpark)
+ - Engine phase from a single tooth cam pulse seen before the first RPM (camEarlyRiseLatch)
 
 ### Fixed
  - A failed configured A/C pressure sensor no longer re-enables the compressor after a pressure cut.
