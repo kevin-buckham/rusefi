@@ -19,6 +19,7 @@ TESTS_SRC_CPP = \
 	tests/log_replay_sandbox.cpp \
 	tests/trigger/test_all_triggers.cpp \
 	tests/trigger/test_tooth_period_window.cpp \
+	tests/trigger/test_cam_early_rise.cpp \
 	tests/trigger/test_trigger_sequence_finder.cpp \
 	tests/trigger/test_2_stroke.cpp \
 	tests/trigger/test_symmetrical_crank.cpp \

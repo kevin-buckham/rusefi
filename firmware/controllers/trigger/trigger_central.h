@@ -55,6 +55,13 @@ public:
 	 * not to be confused with a totally different trigger _wheel_ sync which could be either crank wheel sync or cam wheel sync
 	 */
 	angle_t syncEnginePhaseAndReport(int divider, int remainder);
+	/**
+	 * Single tooth cam rise seen after crank sync but before the first RPM (camEarlyRiseLatch), kept as the sync
+	 * counter it arrived at. Assumes the cam and crank input handlers do not preempt each other (no lock).
+	 */
+	void latchCamEarlyRise();
+	void resetCamEarlyRise(bool clearUsedBit = false);
+	bool isCamEarlyRiseLatched() const { return m_camEarlyRiseValid; }
 	void handleShaftSignal(trigger_event_e signal, efitick_t timestamp);
 	int getHwEventCounter(int index) const;
 	void resetCounters();
@@ -218,6 +225,13 @@ private:
 	Timer m_lastToothTimer;
 	// Phase of the last tooth relative to the sync point
 	float m_lastToothPhaseFromSyncPoint = 0;
+
+	// Gives the phase from a latched cam rise once RPM exists
+	void applyCamEarlyRise();
+	bool m_camEarlyRiseValid = false;
+	// a double rise before RPM: no latch until sync is lost, the engine stops or RPM appears
+	bool m_camEarlyRiseBlocked = false;
+	int m_camEarlyRiseSyncCounter = 0;
 
 	// At what engine phase do we expect the next tooth to arrive?
 	// Used for checking whether your trigger pattern is correct.

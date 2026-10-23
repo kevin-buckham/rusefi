@@ -272,6 +272,7 @@ void RpmCalculator::setStopSpinning() {
 
 	// Broadcast "engine stopped" to all engine modules so they can reset their own state
 	// (trigger sync, instant RPM history, schedulers, etc.). See Engine::onEngineStopped.
+	engine->triggerCentral.resetCamEarlyRise(/*clearUsedBit*/ true);
 	engine->onEngineStopped();
 }
 

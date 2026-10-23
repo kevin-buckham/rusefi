@@ -181,7 +181,8 @@ PUBLIC_API_WEAK angle_t customAdjustCustom(TriggerCentral *tc, vvt_mode_e vvtMod
   return 0;
 }
 
-static angle_t adjustCrankPhase(int camIndex) {
+// singleToothRemainder: sync counter modulo crankDivider at the single tooth cam rise, 0 for a rise as it happens
+static angle_t adjustCrankPhase(int camIndex, int singleToothRemainder = 0) {
 	float maxSyncThreshold = engineConfiguration->maxCamPhaseResolveRpm;
 	if (maxSyncThreshold != 0 && Sensor::getOrZero(SensorType::Rpm) > maxSyncThreshold) {
 		// The user has elected to stop trying to resolve crank phase after some RPM.
@@ -206,6 +207,7 @@ static angle_t adjustCrankPhase(int camIndex) {
 	case VVT_MITSUBISHI_4G63:
 		return tc->syncEnginePhaseAndReport(crankDivider, 1);
 	case VVT_SINGLE_TOOTH:
+		return tc->syncEnginePhaseAndReport(crankDivider, singleToothRemainder);
 	case VVT_NISSAN_VQ:
 	case VVT_BOSCH_QUICK_START:
 	case VVT_BMW_VANOS_RELUCTOR:
@@ -249,6 +251,60 @@ static angle_t adjustCrankPhase(int camIndex) {
 		return 0;
 	}
 	return 0;
+}
+
+void TriggerCentral::latchCamEarlyRise() {
+	if (m_camEarlyRiseBlocked) {
+		return;
+	}
+	int crankDivider = getCrankDivider(getEngineRotationState()->getOperationMode());
+	// two rises within one cam period cannot both be real: trust neither, wait for a live rise
+	if (m_camEarlyRiseValid && triggerState.getSynchronizationCounter() - m_camEarlyRiseSyncCounter < crankDivider) {
+		m_camEarlyRiseValid = false;
+		m_camEarlyRiseBlocked = true;
+		return;
+	}
+	m_camEarlyRiseSyncCounter = triggerState.getSynchronizationCounter();
+	m_camEarlyRiseValid = true;
+}
+
+void TriggerCentral::resetCamEarlyRise(bool clearUsedBit) {
+	m_camEarlyRiseValid = false;
+	m_camEarlyRiseBlocked = false;
+	if (clearUsedBit) {
+		camEarlyRiseUsed = false;
+	}
+}
+
+/**
+ * A live rise at sync counter C makes syncEnginePhase(divider, 0) add s = (-C) mod divider to the counter. The counter
+ * then advances one per trigger cycle, so n cycles later the live rise would have left C + n + s. Asking for remainder
+ * n mod divider adds t with (C + n + t) mod divider = n mod divider, so t = s: the same phase, with no time involved.
+ *
+ * This runs at the end of the tooth that took the first RPM sample. A phase shift that is not a multiple of the divider
+ * drops the next index 0 RPM sample, which would delay the first RPM if it ran before it.
+ */
+void TriggerCentral::applyCamEarlyRise() {
+	if (!m_camEarlyRiseValid) {
+		return;
+	}
+	int crankDivider = getCrankDivider(getEngineRotationState()->getOperationMode());
+	int age = triggerState.getSynchronizationCounter() - m_camEarlyRiseSyncCounter;
+	// older than one cam period the rise could have been in either crank revolution
+	if (!engineConfiguration->camEarlyRiseLatch || crankDivider <= 1 || age < 0 || age >= crankDivider) {
+		resetCamEarlyRise();
+		return;
+	}
+	if (std::isnan(engine->rpmCalculator.oneDegreeUs)) {
+		// still no RPM, the age bounds the wait
+		return;
+	}
+	resetCamEarlyRise();
+	if (!triggerState.getShaftSynchronized() || triggerState.hasSynchronizedPhase()) {
+		return;
+	}
+	adjustCrankPhase(CAM_BY_INDEX(engineConfiguration->engineSyncCam), age);
+	camEarlyRiseUsed = triggerState.hasSynchronizedPhase();
 }
 
 /**
@@ -414,8 +470,16 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
 	if (!currentPhase) {
 		// If we couldn't resolve engine speed (yet primary trigger is sync'd), this
 		// probably means that we have partial crank sync, but not RPM information yet
+		if (engineConfiguration->camEarlyRiseLatch
+				&& index == engineConfiguration->engineSyncCam
+				&& engineConfiguration->vvtMode[camIndex] == VVT_SINGLE_TOOTH
+				&& !tc->triggerState.hasSynchronizedPhase()) {
+			tc->latchCamEarlyRise();
+		}
 		return;
 	}
+	// a rise seen with RPM supersedes a latched one
+	tc->resetCamEarlyRise();
 
 	angle_t angleFromPrimarySyncPoint = currentPhase.Value;
 	// convert trigger cycle angle into engine cycle angle
@@ -1008,7 +1072,11 @@ void TriggerCentral::handleShaftSignal(trigger_event_e signal, efitick_t timesta
 		decodeMapCam(temp_mapVvt_index, timestamp, currentEngineDecodedPhase);
 
 		boardTriggerCallback(timestamp, currentEngineDecodedPhase);
+
+		applyCamEarlyRise();
 	} else {
+		// a latched rise belongs to a sync that is gone
+		resetCamEarlyRise();
 		// We don't have sync, but report to the wave chart anyway as index 0.
 		reportEventToWaveChart(signal, 0, triggerShape.useOnlyRisingEdges);
 
